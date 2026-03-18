@@ -68,7 +68,7 @@ model:
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   epochs:     1
-  batch_size: 12
+  batch_size: 10
 
   # Layers to freeze during fine-tuning.
   # Null → fine-tune all parameters.

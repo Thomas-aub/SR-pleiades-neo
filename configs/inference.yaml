@@ -1,0 +1,72 @@
+# =============================================================================
+# configs/inference.yaml — SwinIR Inference Configuration
+# =============================================================================
+
+# ── External dependency ───────────────────────────────────────────────────────
+kair_root: "KAIR"
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  # Path to a fine-tuned or pretrained SwinIR checkpoint.
+  # Use runs/swinir_finetune/checkpoints/best.pth after fine-tuning.
+  checkpoint_path: "runs/swinir_finetune/checkpoints/best.pth"
+
+  # Key under which model weights are stored in the checkpoint dict.
+  # Fine-tuning checkpoints produced by trainer.py use "model".
+  # Original KAIR/SwinIR pretrained checkpoints use "params".
+  checkpoint_key: "model"
+
+  # ── SwinIR architecture — must match the checkpoint exactly ─────────────
+  upscale:         2
+  in_chans:        3
+  img_size:        64
+  window_size:     8
+  img_range:       1.0
+  depths:          [6, 6, 6, 6, 6, 6]
+  embed_dim:       180
+  num_heads:       [6, 6, 6, 6, 6, 6]
+  mlp_ratio:       2.0
+  upsampler:       "pixelshuffle"
+  resi_connection: "1conv"
+
+# ── Input / output ────────────────────────────────────────────────────────────
+io:
+  # Input LR GeoTIFF — a single tile or a full-resolution image.
+  # Overridden by --input CLI flag.
+  input_path: ""
+
+  # Output directory.  The SR file is written here with the same filename as
+  # the input plus an "_SR" suffix.
+  # Overridden by --output CLI flag.
+  output_dir: "output"
+
+  # Source image bit depth used for normalisation.
+  # Must match the value used during training: 65535 (uint16) or 255 (uint8).
+  dtype_max: 65535
+
+  # Output dtype: "uint16" | "uint8" | "same"
+  # "same" preserves the input dtype.
+  output_dtype: "same"
+
+  # GeoTIFF compression for the output file: "none" | "deflate" | "lzw"
+  compress: "deflate"
+
+# ── Tiling ────────────────────────────────────────────────────────────────────
+# Large images are processed in overlapping tiles to fit in GPU VRAM.
+# Results are blended in the overlap zone to avoid seam artefacts.
+tiling:
+  # Side length of each LR tile sent to the model (pixels).
+  # Smaller = lower peak VRAM.  Must be a multiple of model.window_size.
+  tile_size: 256
+
+  # Overlap between adjacent tiles (LR pixels).
+  # The SR overlap region is blended with a linear ramp.
+  # Larger = smoother seams but more compute.
+  overlap: 16
+
+# ── Miscellaneous ─────────────────────────────────────────────────────────────
+misc:
+  device: "cuda"   # "cuda" | "cpu" | "cuda:1"
+  # Half-precision inference (fp16).  Faster on Ampere+ GPUs.
+  # Disable if you see NaN artefacts in the output.
+  use_fp16: true

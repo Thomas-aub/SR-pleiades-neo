@@ -1,64 +1,45 @@
-# Ignore common Python files
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 env/
 venv/
-*.egg-info
+*.egg-info/
 .tox/
 .mypy_cache/
 .pytest_cache/
-.vscode/
 
-# Ignore data files
+# IDEs and Editors
+.vscode/
+.idea/
+
+# Data and Assets
+data/
+tiles/
+crops/
+asset/
+boat_obb_v*/
 *.tif
 *.tif.aux.xml
-*/data/*
-*/tiles/*
-*/tiles/
-tiles/
-tiles/*
-*/results/*
-/results/*
-/data/*
-*/data
-/asset/*
-/asset
-*/asset/*
-*/asset
-*.pt
 *.npy
 *.geojson
-
 *.png
-boat_obb_v*/
 
+# Model Checkpoints and Weights
+pretrained/
+*.pt
+
+# Results and Outputs
+output/
 runs/
-crops/ 
-crops/*
-
-runs/*
-
-# Ignore results and runs
-*/results/
-*/runs/
-*/results/
-
-# Ignore logs
+results/
 *.log
 
-# Environment variables
+# Environment Variables
 .env
 .flaskenv
 
-
+# External Repositories
 KAIR/
-KAIR/*
-
-runs/
-runs/*
-
-pretrained/
-pretrained/*
