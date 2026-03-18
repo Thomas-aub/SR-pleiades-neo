@@ -1,0 +1,165 @@
+# =============================================================================
+# configs/swinir_finetune.yaml — SwinIR Fine-tuning Configuration
+# =============================================================================
+# All paths are resolved relative to the project root (directory that contains
+# configs/, scripts/, and src/) unless absolute.
+# =============================================================================
+
+
+# ── External dependency ───────────────────────────────────────────────────────
+# Absolute or relative path to a local clone of https://github.com/cszn/KAIR
+# The SwinIR model is imported from KAIR/models/network_swinir.py
+kair_root: "KAIR"
+
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  # Roots for the tiled dataset produced by build_dataset.py
+  train_hr: "data/processed/train/HR"
+  train_lr: "data/processed/train/LR"
+  val_hr:   "data/processed/val/HR"
+  val_lr:   "data/processed/val/LR"
+
+  # Scale factor between LR and HR tiles (must match build_dataset.py output).
+  scale: 2
+
+  # Source image bit depth used for normalisation: 255 (uint8) or 65535 (uint16).
+  dtype_max: 65535
+
+  # LR patch size sampled during training.
+  # HR patch = lr_patch_size * scale.
+  # Must be a multiple of model.window_size (default: 8).
+  lr_patch_size: 64
+
+  # DataLoader settings
+  num_workers: 8
+  pin_memory:  true
+  prefetch_factor: 2
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  # Path to a pretrained SwinIR checkpoint (.pth).
+  # Set to null to train from scratch (not recommended — fine-tuning is far
+  # more stable for remote-sensing data).
+  # Download from: https://github.com/JingyunLiang/SwinIR/releases
+  # Recommended: 001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth
+  pretrained_path: "pretrained/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth"
+
+  # Key under which the model weights are stored in the checkpoint dict.
+  # KAIR checkpoints use "params" or "params_ema".  Set to null to load
+  # the checkpoint directly (no nesting).
+  pretrained_key: "params"
+
+  # ── SwinIR architecture (must match the pretrained checkpoint) ───────────
+  upscale:          2          # SR scale factor
+  in_chans:         3          # Number of input channels (RGB = 3)
+  img_size:         64         # Training patch size fed to the transformer
+  window_size:      8          # Attention window size
+  img_range:        1.0        # Pixel value range after normalisation [0, img_range]
+  depths:           [6, 6, 6, 6, 6, 6]
+  embed_dim:        180
+  num_heads:        [6, 6, 6, 6, 6, 6]
+  mlp_ratio:        2.0
+  upsampler:        "pixelshuffle"   # "pixelshuffle" | "pixelshuffledirect" | ""
+  resi_connection:  "1conv"          # "1conv" | "3conv"
+
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  epochs:     1
+  batch_size: 12
+
+  # Layers to freeze during fine-tuning.
+  # Null → fine-tune all parameters.
+  # Example: ["patch_embed", "layers.0", "layers.1"] to freeze early layers.
+  frozen_prefixes: null
+
+  # Gradient clipping: max L2 norm of the gradient vector.
+  # Null to disable.  KAIR uses 0.01 for SwinIR.
+  grad_clip_norm: 0.01
+
+  # Mixed-precision training (torch.cuda.amp).  Speeds up training on Ampere+
+  # GPUs with negligible quality impact.
+  use_amp: true
+
+  # ── Augmentation ─────────────────────────────────────────────────────────
+  augmentation:
+    horizontal_flip: true
+    vertical_flip:   true
+    rot90:           true    # random 90° rotation (0°, 90°, 180°, 270°)
+
+
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+optimizer:
+  # "adam" | "adamw"
+  type:         "adam"
+  lr:           2.0e-4
+  betas:        [0.9, 0.99]
+  weight_decay: 0.0
+  eps:          1.0e-8
+
+
+# ── LR Scheduler ──────────────────────────────────────────────────────────────
+scheduler:
+  # "multistep" → MultiStepLR (KAIR default for SwinIR fine-tuning)
+  # "cosine"    → CosineAnnealingLR
+  # "none"      → constant LR
+  type: "multistep"
+
+  # MultiStepLR: epoch indices at which LR is multiplied by gamma.
+  # E.g. with 100 epochs: halve at 40, 60, 80 and 90.
+  milestones: [40, 60, 80, 90]
+  gamma:      0.5
+
+  # CosineAnnealingLR: minimum LR at the end of the cosine cycle.
+  eta_min:    1.0e-7
+
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  # Primary reconstruction loss.
+  # "charbonnier"  — smooth L1, standard for KAIR SR models
+  # "l1"           — mean absolute error
+  # "mse"          — mean squared error (L2)
+  type:    "charbonnier"
+  eps:     1.0e-6   # Charbonnier smoothing term (ignored for l1/mse)
+
+  # Optional perceptual (VGG) loss.  Requires torchvision.
+  perceptual:
+    enabled: false
+    weight:  0.1       # Relative weight vs. the primary loss
+    layer:   "relu3_4" # VGG layer used to extract features
+
+
+# ── Logging & checkpointing ───────────────────────────────────────────────────
+logging:
+  # Root directory for all run artefacts (checkpoints, TensorBoard events, …)
+  run_dir: "runs/swinir_finetune"
+
+  # Log a training summary every N iterations (not epochs).
+  log_interval_iters: 1
+
+  # Run full validation every N epochs.
+  val_interval_epochs: 1
+
+  # Save a checkpoint every N epochs.
+  save_interval_epochs: 10
+
+  # Keep only the N most recent periodic checkpoints on disk (saves space).
+  # Best-model checkpoint is always kept regardless of this limit.
+  keep_last_n_checkpoints: 3
+
+  # TensorBoard: set to false to disable.
+  tensorboard: true
+
+
+# ── Miscellaneous ─────────────────────────────────────────────────────────────
+misc:
+  seed:   42
+  device: "cuda"   # "cuda" | "cpu" | "cuda:1" etc.
+
+  # Path to a checkpoint to resume from.  Overrides pretrained_path for
+  # training-state restoration (optimizer, scheduler, epoch).
+  # Set to null to start a fresh fine-tuning run.
+  resume: null

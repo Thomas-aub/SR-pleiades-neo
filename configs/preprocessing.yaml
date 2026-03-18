@@ -1,0 +1,118 @@
+# =============================================================================
+# preprocessing.yaml — Full SR pipeline configuration
+# =============================================================================
+# Used exclusively by preprocessing.py.  All three stages read their
+# parameters from the sections below.  Do not hardcode paths or
+# hyper-parameters inside the Python scripts.
+#
+# Stages (can be selected individually via --stages CLI flag):
+#   pansharpening  →  raw PAN + MS  →  data/pansharpened/HR/
+#   degradation    →  HR TIFs       →  data/pansharpened/LR/
+#   tiling         →  HR + LR TIFs  →  data/processed/train|val/
+# =============================================================================
+
+
+# ── Directory layout ──────────────────────────────────────────────────────────
+# All paths are resolved relative to the working directory unless absolute.
+data:
+  raw_root:        "data/raw"               # Input PAN + MS-FS source TIFs
+  pansharpened_hr: "data/pansharpened/HR"   # Output of pansharpening stage
+  pansharpened_lr: "data/pansharpened/LR"   # Output of degradation stage
+  processed:       "data/processed"         # Output of tiling stage
+
+
+# ── Pansharpening ─────────────────────────────────────────────────────────────
+pansharpening:
+  # Fusion method: "brovey" | "simple_mean"
+  method:        "brovey"
+
+  # Resampling used when upscaling MS to PAN resolution:
+  # "nearest" | "bilinear" | "cubic" | "cubic_spline" | "lanczos"
+  resample_algo: "bilinear"
+
+  # Output bit depth for pansharpened GeoTIFFs: "uint8" | "uint16"
+  output_dtype:  "uint16"
+
+  # Suffix appended to the MS filename stem for the output file.
+  output_suffix: "_PANSHARP"
+
+  # GeoTIFF compression for HR outputs: "none" | "lzw" | "deflate"
+  compress:      "none"
+
+  # Use CuPy (CUDA) for Brovey arithmetic. Falls back to NumPy automatically
+  # if CuPy is unavailable.
+  use_gpu:       true
+
+  # Height (in PAN pixels) of each horizontal processing strip.
+  # Reduce if you run into GPU OOM errors.
+  chunk_rows:    2048
+
+
+# ── Sensor degradation ────────────────────────────────────────────────────────
+degradation:
+  # Use CuPy (CUDA) for FFT-based ops. Falls back to NumPy automatically.
+  use_gpu:      true
+  gpu_device:   0         # CUDA device index (ignored when use_gpu: false)
+
+  # Internal tiling used by degrade_pipeline when processing each HR file.
+  # Larger tiles = higher peak VRAM usage.
+  tile_size:    4096
+  tile_overlap: 64
+
+  # GeoTIFF compression for LR outputs: "none" | "lzw" | "deflate"
+  compress:     "lzw"
+
+  # Skip files whose degraded output already exists on disk.
+  overwrite:    false
+
+  # Ordered list of degradation operations applied to each tile.
+  # Supported ops: mtf_blur | downsample | spectral_misalign | add_noise
+  pipeline:
+    - op:            mtf_blur
+      mtf_nyquist_x: 0.15   # MTF value at Nyquist; lower → stronger blur
+      mtf_nyquist_y: 0.15
+
+    - op:        downsample
+      scale:     2           # Integer downscale factor (also sets HR/LR ratio)
+      resampling: "average"  # GDAL resampling: "average" | "bilinear" | "cubic"
+
+    - op:                spectral_misalign
+      global_shift_px:   [0.3, 0.2]   # [dy, dx] global co-registration error
+      per_band_sigma_px: 0.15          # Per-band random jitter σ (pixels)
+      seed:              42
+
+    - op:   add_noise
+      sigma: 2.0    # Gaussian noise σ (in raw DN units)
+      seed:  42
+
+
+# ── Dataset tiling ────────────────────────────────────────────────────────────
+tiling:
+  # HR tile side length in pixels.
+  # LR tile size = tile_size // scale  (scale inferred from file dimensions).
+  tile_size: 512
+
+  # Fraction of acquisition groups (WO_* directories) assigned to validation.
+  # All files from the same acquisition always land in the same split.
+  val_ratio: 0.2
+
+  # Random seed for reproducible train/val group assignment.
+  seed: 42
+
+  # GeoTIFF compression for output tiles: "none" | "lzw" | "deflate"
+  compress: "deflate"
+
+  # Discard tiles whose fraction of non-zero (valid) pixels is below this
+  # threshold.  Set to 0.0 to keep all tiles including nodata-only ones.
+  min_valid_fraction: 0.1
+
+  # Re-tile and overwrite tiles that already exist on disk.
+  overwrite: false
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"    # DEBUG | INFO | WARNING | ERROR
+  # Absolute or relative path for a persistent log file.
+  # Set to null (or omit) to log to the console only.
+  file: null

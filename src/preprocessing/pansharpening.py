@@ -32,7 +32,7 @@ PANSHARPEN_METHOD = "brovey"
 # ── Resampling algorithm used when upscaling the RGB to PAN resolution ────────
 # Any rasterio / GDAL resampling name:
 #   "nearest" | "bilinear" | "cubic" | "cubic_spline" | "lanczos"
-RESAMPLE_ALGO     = "lanczos"
+RESAMPLE_ALGO     = "bilinear"
 
 # ── Output options ────────────────────────────────────────────────────────────
 OUTPUT_DTYPE      = "uint16"     # Output pixel depth: "uint8" or "uint16"
@@ -234,8 +234,12 @@ def process_pair(rgb_path, pan_path, output_root, input_root):
             pan_transform = pan_src.transform
             pan_crs = pan_src.crs
 
-            pan_max = pan_src.read(1, masked=True).max()
-            rgb_max = rgb_src.read([1,2,3], masked=True).max()
+            
+            pan_cpu_full = pan_src.read(1, masked=True)
+            pan_max = np.percentile(pan_cpu_full.compressed(), 99.9)
+
+            rgb_cpu_full = rgb_src.read([1,2,3], masked=True)
+            rgb_max = np.percentile(rgb_cpu_full.compressed(), 99.9)
 
             pan_max = pan_max if pan_max else 1
             rgb_max = rgb_max if rgb_max else 1

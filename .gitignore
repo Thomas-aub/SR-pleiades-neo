@@ -54,3 +54,11 @@ runs/*
 .flaskenv
 
 
+KAIR/
+KAIR/*
+
+runs/
+runs/*
+
+pretrained/
+pretrained/*
