@@ -67,13 +67,57 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  epochs:     1
-  batch_size: 10
+  epochs:     6
+  batch_size: 8
 
-  # Layers to freeze during fine-tuning.
+  # ── Static freeze (applied for the entire run) ────────────────────────────
+  # Ignored when freeze_schedule is defined below.
   # Null → fine-tune all parameters.
-  # Example: ["patch_embed", "layers.0", "layers.1"] to freeze early layers.
   frozen_prefixes: null
+
+  # ── Freeze schedule (staged fine-tuning) ─────────────────────────────────
+  # List of phases applied in epoch order.  Each phase has:
+  #   until_epoch    : phase is active while epoch < until_epoch.
+  #                    null = "for all remaining epochs".
+  #   frozen_prefixes: parameter name prefixes to freeze.
+  #                    null = unfreeze everything.
+  #
+  # SwinIR layer names (use as prefixes):
+  #   patch_embed          — initial patch tokenisation
+  #   layers.0 … layers.5  — 6 RSTB transformer stages (pretrained backbone)
+  #   norm                 — final layer normalisation
+  #   conv_after_body      — bridge conv (body → SR head)
+  #   conv_before_upsample — first conv of SR head
+  #   upsample             — pixel-shuffle upsampling block
+  #   conv_last            — final 3-channel output conv
+  #
+  # Recommended two-phase strategy for Pléiades NEO fine-tuning:
+  #
+  #   Phase 1  epochs  0–19  (20 epochs)
+  #     Freeze the entire transformer backbone.  Only the SR head trains
+  #     (~550 K / 11.7 M params).  Loss drops fast.  Head adapts to
+  #     Pléiades radiometry without corrupting pretrained features.
+  #
+  #   Phase 2  epochs 20–199  (180 epochs)
+  #     Unfreeze everything.  Transformer refines feature extraction for
+  #     satellite textures (vegetation edges, building corners, water)
+  #     that differ from the DF2K natural-photo pretrain set.
+  #
+  # Set to null or [] to disable staged training.
+  freeze_schedule:
+    - until_epoch:      4
+      frozen_prefixes:
+        - "patch_embed"
+        - "layers.0"
+        - "layers.1"
+        - "layers.2"
+        - "layers.3"
+        - "layers.4"
+        - "layers.5"
+        - "norm"
+
+    - until_epoch:     null   # epoch 20 onwards
+      frozen_prefixes: null   # unfreeze all
 
   # Gradient clipping: max L2 norm of the gradient vector.
   # Null to disable.  KAIR uses 0.01 for SwinIR.
@@ -94,7 +138,7 @@ training:
 optimizer:
   # "adam" | "adamw"
   type:         "adam"
-  lr:           2.0e-4
+  lr:           5.0e-5
   betas:        [0.9, 0.99]
   weight_decay: 0.0
   eps:          1.0e-8
@@ -109,7 +153,7 @@ scheduler:
 
   # MultiStepLR: epoch indices at which LR is multiplied by gamma.
   # E.g. with 100 epochs: halve at 40, 60, 80 and 90.
-  milestones: [40, 60, 80, 90]
+  milestones: [80, 120, 160, 180]
   gamma:      0.5
 
   # CosineAnnealingLR: minimum LR at the end of the cosine cycle.
@@ -138,10 +182,10 @@ logging:
   run_dir: "runs/swinir_finetune"
 
   # Log a training summary every N iterations (not epochs).
-  log_interval_iters: 1
+  log_interval_iters: 100
 
   # Run full validation every N epochs.
-  val_interval_epochs: 1
+  val_interval_epochs: 2
 
   # Save a checkpoint every N epochs.
   save_interval_epochs: 10

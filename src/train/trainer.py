@@ -25,6 +25,7 @@ Design decisions
 
 from __future__ import annotations
 
+import csv
 import logging
 import time
 from collections import deque
@@ -130,6 +131,11 @@ class Trainer:
         self.ckpt_dir = self.run_dir / "checkpoints"
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+        # results.csv — opened lazily in fit(), flushed after every row.
+        self._csv_path:   Path       = self.run_dir / "results.csv"
+        self._csv_file:   Optional[Any] = None
+        self._csv_writer: Optional[Any] = None
+
         # AMP scaler — only active on CUDA.
         self._use_amp = (
             getattr(cfg.training, "use_amp", False)
@@ -152,9 +158,15 @@ class Trainer:
         self._keep_n           = int(getattr(cfg.logging, "keep_last_n_checkpoints", 3))
 
         # State maintained across epochs.
-        self.start_epoch: int  = 0
+        self.start_epoch: int   = 0
         self.best_psnr:   float = 0.0
         self._periodic_ckpts: Deque[Path] = deque()
+
+        # ── Freeze schedule ───────────────────────────────────────────────────
+        # Parsed once from cfg.training.freeze_schedule (list of phase dicts).
+        # Applied at the start of each epoch via _apply_freeze_schedule().
+        self._freeze_schedule: List[Dict] = self._parse_freeze_schedule()
+        self._current_frozen_prefixes: Optional[List[str]] = None  # sentinel
 
         log.info(
             "Trainer ready — AMP=%s  window_size=%d  scale=%d  "
@@ -162,6 +174,173 @@ class Trainer:
             self._use_amp, self._window_size, self._scale,
             self._val_interval, self._save_interval,
         )
+        if self._freeze_schedule:
+            log.info("Freeze schedule: %d phase(s) defined.", len(self._freeze_schedule))
+            for phase in self._freeze_schedule:
+                label = f"epochs 0–{phase['until_epoch'] - 1}" if phase["until_epoch"] is not None else "remaining epochs"
+                prefixes = phase["frozen_prefixes"] or "none (all layers trainable)"
+                log.info("  %-30s  frozen: %s", label, prefixes)
+
+    # ------------------------------------------------------------------
+    # Freeze schedule helpers
+    # ------------------------------------------------------------------
+
+    def _parse_freeze_schedule(self) -> List[Dict]:
+        """Parse and validate training.freeze_schedule from config.
+
+        Each entry in the YAML list must have:
+            until_epoch    : int | null — this phase applies for epochs < until_epoch.
+                             null means "for all remaining epochs".
+            frozen_prefixes: list[str] | null — parameter name prefixes to freeze.
+                             null means "unfreeze everything".
+
+        Phases are sorted by until_epoch (null = infinity) so they are applied
+        in the correct order regardless of YAML ordering.
+
+        Returns an empty list when no schedule is configured, in which case the
+        static frozen_prefixes from build_model() is used for the whole run.
+        """
+        raw = getattr(getattr(self.cfg, "training", {}), "freeze_schedule", None)
+        if not raw:
+            return []
+
+        parsed = []
+        for i, entry in enumerate(raw):
+            until = entry.get("until_epoch", None)
+            prefixes = entry.get("frozen_prefixes", None)
+            if until is not None:
+                until = int(until)
+                if until < 1:
+                    raise ValueError(
+                        f"freeze_schedule[{i}].until_epoch must be ≥ 1, got {until}."
+                    )
+            parsed.append({"until_epoch": until, "frozen_prefixes": prefixes})
+
+        # Sort: phases with a finite until_epoch come first (ascending),
+        # the catch-all null phase (if any) comes last.
+        parsed.sort(key=lambda p: p["until_epoch"] if p["until_epoch"] is not None else float("inf"))
+        return parsed
+
+    def _apply_freeze_schedule(self, epoch: int) -> None:
+        """Freeze / unfreeze model parameters according to the schedule.
+
+        Finds the first phase whose until_epoch > epoch (i.e. the phase that
+        is currently active) and applies its frozen_prefixes.  If the active
+        set of prefixes has not changed since last epoch, this is a no-op so
+        there is no overhead in the common case.
+
+        Called at the *start* of each epoch before _train_epoch() so the
+        optimizer only sees trainable parameters for that epoch.
+
+        Note: the optimizer was built with all parameters; we set
+        requires_grad=False rather than rebuilding the optimizer, which means
+        the optimizer state for frozen parameters persists in memory but is not
+        updated.  This is intentional — it allows seamless unfreezing later.
+        """
+        if not self._freeze_schedule:
+            return
+
+        # Find the active phase for this epoch.
+        active_prefixes = None  # default: unfreeze all
+        for phase in self._freeze_schedule:
+            if phase["until_epoch"] is None or epoch < phase["until_epoch"]:
+                active_prefixes = phase["frozen_prefixes"]
+                break
+
+        # Normalise to a frozenset for O(1) change detection.
+        active_set = frozenset(active_prefixes) if active_prefixes else frozenset()
+        prev_set   = frozenset(self._current_frozen_prefixes) if self._current_frozen_prefixes else frozenset()
+
+        if active_set == prev_set:
+            return  # No change — skip the parameter scan.
+
+        self._current_frozen_prefixes = list(active_prefixes) if active_prefixes else []
+
+        frozen_count   = 0
+        trainable_count = 0
+        frozen_params  = 0
+        trainable_params = 0
+
+        for name, param in self.model.named_parameters():
+            should_freeze = bool(active_prefixes) and any(
+                name.startswith(p) for p in active_prefixes
+            )
+            param.requires_grad = not should_freeze
+            if should_freeze:
+                frozen_count  += 1
+                frozen_params += param.numel()
+            else:
+                trainable_count  += 1
+                trainable_params += param.numel()
+
+        total = frozen_params + trainable_params
+        if active_prefixes:
+            log.info(
+                "Freeze schedule  [epoch %d]  frozen=%d tensors (%s params, %.1f%%)  "
+                "trainable=%d tensors (%s params)  prefixes=%s",
+                epoch + 1,
+                frozen_count, f"{frozen_params:,}", 100.0 * frozen_params / max(total, 1),
+                trainable_count, f"{trainable_params:,}",
+                active_prefixes,
+            )
+        else:
+            log.info(
+                "Freeze schedule  [epoch %d]  all layers unfrozen  "
+                "trainable=%s params",
+                epoch + 1, f"{trainable_params:,}",
+            )
+
+        if self.writer:
+            self.writer.add_scalar("train/trainable_params", trainable_params, epoch)
+
+    # ------------------------------------------------------------------
+    # CSV logging helpers
+    # ------------------------------------------------------------------
+
+    _CSV_COLUMNS = [
+        "epoch",
+        "train_loss",
+        "val_psnr_db",
+        "val_ssim",
+        "lr",
+        "trainable_params",
+        "frozen_prefixes",
+        "epoch_time_s",
+        "is_best",
+    ]
+
+    def _open_csv(self, resume: bool) -> None:
+        """Open (or append to) results.csv.
+
+        On a fresh run the header is written first.  When resuming, rows
+        are appended so the file contains the full history of all runs.
+        """
+        mode = "a" if (resume and self._csv_path.exists()) else "w"
+        self._csv_file   = open(self._csv_path, mode, newline="", encoding="utf-8")
+        self._csv_writer = csv.DictWriter(
+            self._csv_file,
+            fieldnames=self._CSV_COLUMNS,
+            extrasaction="ignore",
+        )
+        if mode == "w":
+            self._csv_writer.writeheader()
+            self._csv_file.flush()
+        log.info("Results CSV → %s  (mode='%s')", self._csv_path, mode)
+
+    def _write_csv_row(self, row: Dict) -> None:
+        """Append one row and flush immediately so the file is always current."""
+        if self._csv_writer is None:
+            return
+        full_row = {col: "" for col in self._CSV_COLUMNS}
+        full_row.update(row)
+        self._csv_writer.writerow(full_row)
+        self._csv_file.flush()
+
+    def _close_csv(self) -> None:
+        if self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file   = None
+            self._csv_writer = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -177,8 +356,14 @@ class Trainer:
             start_epoch, total_epochs, total_epochs - start_epoch,
         )
 
+        self._open_csv(resume=start_epoch > 0)
+
         for epoch in range(start_epoch, total_epochs):
             epoch_start = time.perf_counter()
+
+            # Apply freeze schedule before training so grad flags are correct.
+            self._apply_freeze_schedule(epoch)
+
             train_metrics = self._train_epoch(epoch, total_epochs)
 
             # LR scheduler step (MultiStep / Cosine).
@@ -200,23 +385,29 @@ class Trainer:
                 self.writer.add_scalar("train/lr",   current_lr,            epoch)
 
             # ── Validation ────────────────────────────────────────────────────
-            is_best = False
-            if (epoch + 1) % self._val_interval == 0 or epoch == total_epochs - 1:
+            is_best    = False
+            val_psnr   = float("nan")
+            val_ssim   = float("nan")
+            run_val    = (epoch + 1) % self._val_interval == 0 or epoch == total_epochs - 1
+
+            if run_val:
                 val_metrics = self._validate(epoch, total_epochs)
-                is_best = val_metrics["psnr"] > self.best_psnr
+                val_psnr    = val_metrics["psnr"]
+                val_ssim    = val_metrics["ssim"]
+                is_best     = val_psnr > self.best_psnr
                 if is_best:
-                    self.best_psnr = val_metrics["psnr"]
+                    self.best_psnr = val_psnr
 
                 log.info(
                     "  Val [%d/%d]  PSNR=%.4f dB  SSIM=%.4f%s",
                     epoch + 1, total_epochs,
-                    val_metrics["psnr"], val_metrics["ssim"],
+                    val_psnr, val_ssim,
                     "  ← best" if is_best else "",
                 )
 
                 if self.writer:
-                    self.writer.add_scalar("val/psnr", val_metrics["psnr"], epoch)
-                    self.writer.add_scalar("val/ssim", val_metrics["ssim"], epoch)
+                    self.writer.add_scalar("val/psnr", val_psnr, epoch)
+                    self.writer.add_scalar("val/ssim", val_ssim, epoch)
 
                 if is_best:
                     self._save(epoch, best_psnr=self.best_psnr, name="best.pth")
@@ -225,7 +416,25 @@ class Trainer:
             if (epoch + 1) % self._save_interval == 0 or epoch == total_epochs - 1:
                 self._save_periodic(epoch)
 
+            # ── CSV row ───────────────────────────────────────────────────────
+            trainable_p = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            self._write_csv_row({
+                "epoch":            epoch + 1,
+                "train_loss":       f"{train_metrics['loss']:.8f}",
+                "val_psnr_db":      f"{val_psnr:.4f}" if run_val else "",
+                "val_ssim":         f"{val_ssim:.6f}"  if run_val else "",
+                "lr":               f"{current_lr:.2e}",
+                "trainable_params": trainable_p,
+                "frozen_prefixes":  "|".join(self._current_frozen_prefixes)
+                                    if self._current_frozen_prefixes else "",
+                "epoch_time_s":     f"{elapsed:.1f}",
+                "is_best":          "1" if is_best else "0",
+            })
+
         log.info("Fine-tuning complete.  Best val PSNR: %.4f dB", self.best_psnr)
+        self._close_csv()
         if self.writer:
             self.writer.close()
 
