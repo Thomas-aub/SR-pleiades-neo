@@ -9,7 +9,7 @@ kair_root: "KAIR"
 model:
   # Path to a fine-tuned or pretrained SwinIR checkpoint.
   # Use runs/swinir_finetune/checkpoints/best.pth after fine-tuning.
-  checkpoint_path: "runs/swinir_finetune/checkpoints/best.pth"
+  checkpoint_path: "runs/swinir_finetune_2/checkpoints/best.pth"
 
   # Key under which model weights are stored in the checkpoint dict.
   # Fine-tuning checkpoints produced by trainer.py use "model".

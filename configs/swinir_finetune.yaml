@@ -29,8 +29,7 @@ data:
   # LR patch size sampled during training.
   # HR patch = lr_patch_size * scale.
   # Must be a multiple of model.window_size (default: 8).
-  lr_patch_size: 64
-
+  lr_patch_size: 256
   # DataLoader settings
   num_workers: 8
   pin_memory:  true
@@ -67,8 +66,8 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  epochs:     6
-  batch_size: 8
+  epochs:     200
+  batch_size: 32
 
   # ── Static freeze (applied for the entire run) ────────────────────────────
   # Ignored when freeze_schedule is defined below.
@@ -105,7 +104,7 @@ training:
   #
   # Set to null or [] to disable staged training.
   freeze_schedule:
-    - until_epoch:      4
+    - until_epoch:      10
       frozen_prefixes:
         - "patch_embed"
         - "layers.0"
@@ -137,8 +136,8 @@ training:
 # ── Optimizer ─────────────────────────────────────────────────────────────────
 optimizer:
   # "adam" | "adamw"
-  type:         "adam"
-  lr:           5.0e-5
+  type:         "adamw"
+  lr:           1.0e-4
   betas:        [0.9, 0.99]
   weight_decay: 0.0
   eps:          1.0e-8
@@ -179,13 +178,13 @@ loss:
 # ── Logging & checkpointing ───────────────────────────────────────────────────
 logging:
   # Root directory for all run artefacts (checkpoints, TensorBoard events, …)
-  run_dir: "runs/swinir_finetune"
+  run_dir: "runs/swinir_finetune_2"
 
   # Log a training summary every N iterations (not epochs).
   log_interval_iters: 100
 
   # Run full validation every N epochs.
-  val_interval_epochs: 2
+  val_interval_epochs: 4
 
   # Save a checkpoint every N epochs.
   save_interval_epochs: 10
