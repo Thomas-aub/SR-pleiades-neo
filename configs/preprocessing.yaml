@@ -1,14 +1,17 @@
 # =============================================================================
-# preprocessing.yaml — Full SR pipeline configuration
+# preprocessing.yaml — Pléiades NEO SR Preprocessing Pipeline Configuration
 # =============================================================================
-# Used exclusively by preprocessing.py.  All three stages read their
-# parameters from the sections below.  Do not hardcode paths or
-# hyper-parameters inside the Python scripts.
+# Single source of truth for the full three-stage pipeline:
 #
-# Stages (can be selected individually via --stages CLI flag):
-#   pansharpening  →  raw PAN + MS  →  data/pansharpened/HR/
-#   degradation    →  HR TIFs       →  data/pansharpened/LR/
-#   tiling         →  HR + LR TIFs  →  data/processed/train|val/
+#   Stage 1 · pansharpening   data/raw/         →  data/pansharpened/HR/
+#   Stage 2 · degradation     pansharpened/HR/  →  data/pansharpened/LR/
+#   Stage 3 · tiling          HR/ + LR/         →  data/processed/train|val/
+#
+# Run with:
+#   python preprocessing.py                               # full pipeline
+#   python preprocessing.py --stages degradation tiling  # skip pansharpening
+#   python preprocessing.py --from-stage tiling          # start from tiling
+#   python preprocessing.py --dry-run                    # validate only
 # =============================================================================
 
 
@@ -16,103 +19,151 @@
 # All paths are resolved relative to the working directory unless absolute.
 data:
   raw_root:        "data/raw"               # Input PAN + MS-FS source TIFs
-  pansharpened_hr: "data/pansharpened/HR"   # Output of pansharpening stage
-  pansharpened_lr: "data/pansharpened/LR"   # Output of degradation stage
-  processed:       "data/processed"         # Output of tiling stage
+  pansharpened_hr: "data/pansharpened/HR"   # Stage 1 output / Stage 2 input
+  pansharpened_lr: "data/pansharpened/LR"   # Stage 2 output / Stage 3 input
+  processed:       "data/processed"         # Stage 3 output (tiled dataset)
 
 
-# ── Pansharpening ─────────────────────────────────────────────────────────────
+# ── Stage 1 — Pansharpening ───────────────────────────────────────────────────
 pansharpening:
   # Fusion method: "brovey" | "simple_mean"
-  method:        "brovey"
+  # brovey:       (R/ΣRG B) × PAN — preserves relative radiance ratios.
+  # simple_mean:  (MS + PAN) / 2  — faster, lower contrast.
+  method: "brovey"
 
-  # Resampling used when upscaling MS to PAN resolution:
-  # "nearest" | "bilinear" | "cubic" | "cubic_spline" | "lanczos"
+  # Resampling used when upscaling MS from 1.2 m to PAN 0.3 m resolution.
+  # "bilinear" is a good default; "lanczos" is sharper but slower.
   resample_algo: "bilinear"
 
-  # Output bit depth for pansharpened GeoTIFFs: "uint8" | "uint16"
-  output_dtype:  "uint16"
+  # Output bit depth. "uint16" preserves full radiometric depth of PAN.
+  output_dtype: "uint16"
 
-  # Suffix appended to the MS filename stem for the output file.
+  # Suffix appended to the MS filename stem for each pansharpened output.
   output_suffix: "_PANSHARP"
 
-  # GeoTIFF compression for HR outputs: "none" | "lzw" | "deflate"
-  compress:      "none"
+  # GeoTIFF compression for HR outputs.
+  # "none" is fastest for writing; use "deflate" to save disk space.
+  compress: "none"
 
-  # Use CuPy (CUDA) for Brovey arithmetic. Falls back to NumPy automatically
-  # if CuPy is unavailable.
-  use_gpu:       true
+  # Use CuPy (CUDA) for Brovey arithmetic.
+  # Automatically falls back to NumPy if CuPy is unavailable.
+  use_gpu: true
 
   # Height (in PAN pixels) of each horizontal processing strip.
-  # Reduce if you run into GPU OOM errors.
-  chunk_rows:    2048
+  # Peak VRAM ≈ chunk_rows × image_width × 3 bands × 4 bytes.
+  # Reduce if CUDA OOM; increase (up to image height) for fewer GPU transfers.
+  chunk_rows: 2048
 
 
-# ── Sensor degradation ────────────────────────────────────────────────────────
+# ── Stage 2 — Sensor Degradation ─────────────────────────────────────────────
 degradation:
-  # Use CuPy (CUDA) for FFT-based ops. Falls back to NumPy automatically.
-  use_gpu:      true
-  gpu_device:   0         # CUDA device index (ignored when use_gpu: false)
+  # Use CuPy (CUDA) for FFT-based MTF blur and spectral misalignment.
+  use_gpu: true
 
-  # Internal tiling used by degrade_pipeline when processing each HR file.
-  # Larger tiles = higher peak VRAM usage.
-  tile_size:    4096
+  # CUDA device index. Ignored when use_gpu is false.
+  gpu_device: 0
+
+  # Internal tile size for processing each HR image (source pixels).
+  # Peak VRAM per tile ≈ (tile_size + tile_overlap)² × n_bands × 8 bytes.
+  # 4096 requires ~3 GB VRAM for a 3-band uint16 image.
+  tile_size: 4096
+
+  # Symmetric overlap between adjacent processing tiles (source pixels).
+  # Larger overlap reduces FFT wrap-around artefacts at tile edges.
   tile_overlap: 64
 
-  # GeoTIFF compression for LR outputs: "none" | "lzw" | "deflate"
-  compress:     "lzw"
+  # GeoTIFF compression for LR outputs.
+  compress: "lzw"
 
-  # Skip files whose degraded output already exists on disk.
-  overwrite:    false
+  # Skip files whose LR output already exists on disk.
+  # Set to true to resume an interrupted degradation run.
+  overwrite: false
 
-  # Ordered list of degradation operations applied to each tile.
-  # Supported ops: mtf_blur | downsample | spectral_misalign | add_noise
+  # ── Degradation operations (applied in listed order) ──────────────────────
+  # Supported ops:
+  #   mtf_blur         — anisotropic Gaussian MTF in frequency domain.
+  #   downsample       — integer spatial downscale via rasterio reproject.
+  #   spectral_misalign— two-component inter-band misregistration (FFT).
+  #   add_noise        — zero-mean Gaussian noise on valid pixels.
   pipeline:
+    # MTF blur: simulates the optical PSF of a lower-resolution sensor.
+    # mtf_nyquist_x/y: MTF value at Nyquist frequency (0 < value < 1).
+    # Lower values → stronger blur → harder SR task.
     - op:            mtf_blur
-      mtf_nyquist_x: 0.15   # MTF value at Nyquist; lower → stronger blur
+      mtf_nyquist_x: 0.15
       mtf_nyquist_y: 0.15
 
+    # Downsample: spatial scale factor between HR and LR.
+    # scale=2 → LR is half the HR resolution in each axis.
+    # Must match model.upscale in swinir_finetune.yaml.
     - op:        downsample
-      scale:     2           # Integer downscale factor (also sets HR/LR ratio)
-      resampling: "average"  # GDAL resampling: "average" | "bilinear" | "cubic"
+      scale:     2
+      resampling: "average"   # "average" | "bilinear" | "cubic"
 
+    # Spectral misalignment: simulates PAN–MS co-registration error.
+    # global_shift_px: shared [dy, dx] shift in LR pixels for all bands.
+    # per_band_sigma_px: independent Gaussian jitter σ per band.
     - op:                spectral_misalign
-      global_shift_px:   [0.3, 0.2]   # [dy, dx] global co-registration error
-      per_band_sigma_px: 0.15          # Per-band random jitter σ (pixels)
+      global_shift_px:   [0.3, 0.2]
+      per_band_sigma_px: 0.15
       seed:              42
 
+    # Gaussian noise: sensor read noise on valid (non-nodata) pixels only.
+    # sigma: noise standard deviation in raw DN units (same scale as input).
     - op:   add_noise
-      sigma: 2.0    # Gaussian noise σ (in raw DN units)
+      sigma: 2.0
       seed:  42
 
 
-# ── Dataset tiling ────────────────────────────────────────────────────────────
+# ── Stage 3 — Dataset Tiling ──────────────────────────────────────────────────
 tiling:
   # HR tile side length in pixels.
-  # LR tile size = tile_size // scale  (scale inferred from file dimensions).
+  # LR tile = tile_size ÷ scale (scale inferred from file dimensions).
+  # Must be a multiple of the SwinIR window_size (default: 8).
   tile_size: 512
 
-  # Fraction of acquisition groups (WO_* directories) assigned to validation.
-  # All files from the same acquisition always land in the same split.
+  # Fraction of WO_* acquisition groups assigned to the validation set.
+  # All files in the same acquisition directory always land in the same split.
   val_ratio: 0.2
 
   # Random seed for reproducible train/val group assignment.
   seed: 42
 
-  # GeoTIFF compression for output tiles: "none" | "lzw" | "deflate"
+  # GeoTIFF compression for output tile files.
   compress: "deflate"
 
   # Discard tiles whose fraction of non-zero (valid) pixels is below this
-  # threshold.  Set to 0.0 to keep all tiles including nodata-only ones.
+  # threshold. Set to 0.0 to keep all tiles including nodata-only ones.
   min_valid_fraction: 0.1
 
   # Re-tile and overwrite tiles that already exist on disk.
+  # Set to true when changing tile_size or stats parameters.
   overwrite: false
+
+  # ── QGIS display statistics ───────────────────────────────────────────────
+  # Percentiles used to compute the STATISTICS_MINIMUM / STATISTICS_MAXIMUM
+  # tags embedded in every output tile.
+  #
+  # These tags define the display stretch range in QGIS and other GIS tools.
+  # They do NOT alter pixel data — only metadata.
+  #
+  # Strategy (mirrors tiler.py):
+  #   • Statistics are computed once from a full-scene thumbnail before the
+  #     tile loop, so every tile from the same source image shares the same
+  #     stretch range — adjacent tiles over water and sand look consistent.
+  #   • Percentiles (not absolute min/max) exclude outlier pixels:
+  #     p1 clips the darkest 1% (nodata, deep shadow);
+  #     p99 clips the brightest 1% (sensor hot pixels, specular reflections).
+  #   • Zero pixels are excluded — they are the nodata/padding convention
+  #     used throughout this pipeline.
+  stats_min_percentile: 1.0    # lower display bound (p1 of valid pixels)
+  stats_max_percentile: 99.0   # upper display bound (p99 of valid pixels)
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
   level: "INFO"    # DEBUG | INFO | WARNING | ERROR
-  # Absolute or relative path for a persistent log file.
-  # Set to null (or omit) to log to the console only.
+
+  # Path for a persistent log file. null → console only.
+  # Example: "runs/preprocessing.log"
   file: null

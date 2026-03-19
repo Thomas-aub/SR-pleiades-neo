@@ -51,6 +51,16 @@ SEED      = 42
 # GeoTIFF compression for output tiles.  "none" | "deflate" | "lzw"
 COMPRESS  = "deflate"
 
+# ── Display statistics ────────────────────────────────────────────────────────
+# Percentiles used to compute the STATISTICS_MINIMUM / STATISTICS_MAXIMUM tags
+# embedded in every tile.  These values define the display stretch range that
+# QGIS and other readers use for visualisation — they do NOT alter pixel data.
+# Mirroring tiler.py:  p1 / p99 gives a robust stretch that excludes outliers
+# (sensor hot pixels, deep-shadow zeros) while keeping consistent colour
+# rendering across all tiles from the same source image.
+STATS_MIN_PERCENTILE = 1.0
+STATS_MAX_PERCENTILE = 99.0
+
 # Tiles whose valid (non-zero) pixel fraction is below this threshold are
 # discarded.  Set to 0.0 to keep all tiles including fully black/nodata ones.
 MIN_VALID_FRACTION = 0.1
@@ -111,6 +121,33 @@ class ImagePair:
     lr_path: Path
     # Relative path from the HR/LR root, e.g. WO_.../IMG_...TIF
     rel_path: Path
+
+
+@dataclass(frozen=True)
+class BandStats:
+    """Global display statistics for one band, derived from a source thumbnail.
+
+    Written as GDAL STATISTICS_* tags into every tile from the same source
+    image so that QGIS uses the same stretch for all tiles — eliminating the
+    "adjacent tiles have completely different colours" artefact.
+
+    Attributes
+    ----------
+    minimum : p1 of valid pixels (robust lower bound — excludes outliers).
+    maximum : p99 of valid pixels (robust upper bound — excludes hot pixels).
+    mean    : Mean of valid pixels.
+    stddev  : Standard deviation of valid pixels.
+
+    Using percentiles (not absolute min/max) mirrors the approach in tiler.py
+    and matches QGIS's "stretch to min-max" behaviour — which uses per-dataset
+    statistics when available.  A tile over dark water and a tile over bright
+    sand are both stretched using the same scene-level p1→p99 range, so their
+    displayed colours remain photometrically consistent.
+    """
+    minimum: float   # p(min_percentile) of valid pixels
+    maximum: float   # p(max_percentile) of valid pixels
+    mean:    float
+    stddev:  float
 
 
 @dataclass
@@ -280,6 +317,83 @@ def detect_scale_factor(hr_path: Path, lr_path: Path) -> int:
 # Tiling primitives
 # ---------------------------------------------------------------------------
 
+def _compute_global_stats(
+    src:            "rasterio.DatasetReader",
+    nodata:         Optional[float],
+    min_percentile: float = 1.0,
+    max_percentile: float = 99.0,
+) -> List[BandStats]:
+    """Compute per-band display statistics from a source thumbnail.
+
+    Ported from tiler.py (ImageTiler.tile_image Step 1) — the same approach
+    that produces consistent QGIS visualisation in the vessel detection pipeline.
+
+    Why a thumbnail?
+    ----------------
+    Full-resolution Pléiades NEO scenes are 5–30 k pixels on a side.  A
+    thumbnail at ≤1024 px gives statistically identical percentiles at
+    negligible I/O cost.
+
+    Why percentiles, not absolute min/max?
+    ----------------------------------------
+    Absolute min/max is dominated by outliers: sensor hot pixels drive the
+    maximum up, deep-shadow or nodata zeros pull the minimum down.  Using
+    p1 / p99 (same as tiler.py) clips at most 1 % on each tail, matching
+    what QGIS's "stretch to min-max" button does when computing statistics
+    from the file.  All tiles from the same source image share these numbers,
+    so a dark-water tile and a bright-sand tile are displayed with the same
+    LUT — photometrically consistent.
+
+    Why exclude zero pixels?
+    -------------------------
+    Zero is the nodata / black-padding convention used throughout the
+    pipeline (build_dataset.py, tiler.py).  Including zeros in the
+    percentile calculation would drag the minimum to 0, collapsing the
+    effective stretch range and darkening all tiles.
+    """
+    W, H    = src.width, src.height
+    scale_t = min(1.0, 1024.0 / max(W, H))
+    out_h   = max(1, int(H * scale_t))
+    out_w   = max(1, int(W * scale_t))
+
+    from rasterio.enums import Resampling as _R
+    thumb = src.read(
+        out_shape=(src.count, out_h, out_w),
+        resampling=_R.bilinear,
+    ).astype(np.float64)
+
+    stats: List[BandStats] = []
+    for b in range(src.count):
+        band = thumb[b]
+
+        # Mirror tiler.py: exclude zero-valued pixels (nodata / black padding)
+        # and, if the dataset declares a nodata value, exclude that too.
+        if nodata is not None:
+            valid = band[(band != nodata) & (band > 0)]
+        else:
+            valid = band[band > 0]
+
+        if valid.size == 0:
+            # Fallback for completely empty tiles (all nodata) — use neutral
+            # values that won't clip real content in other tiles.
+            stats.append(BandStats(0.0, 1.0, 0.5, 0.0))
+        else:
+            # Percentile-based stretch — identical to tiler.py Step 1.
+            lo = float(np.percentile(valid, min_percentile))
+            hi = float(np.percentile(valid, max_percentile))
+            if hi <= lo:
+                hi = lo + 1.0   # guard against flat bands
+            stats.append(BandStats(
+                minimum = lo,
+                maximum = hi,
+                mean    = float(valid.mean()),
+                stddev  = float(valid.std()),
+            ))
+
+    del thumb
+    return stats
+
+
 def _iter_tile_windows(
     width:     int,
     height:    int,
@@ -315,41 +429,103 @@ def _is_valid_tile(
     return (valid / total) >= min_valid_fraction
 
 
+def _block_size(pixels: int, preferred: int = 256) -> int:
+    """Return the largest multiple of 16 that is ≤ min(preferred, pixels).
+
+    GDAL requires GeoTIFF block dimensions to be multiples of 16.
+    """
+    cap     = min(preferred, pixels)
+    snapped = (cap // 16) * 16
+    return max(snapped, 16)
+
+
+def _photometric(n_bands: int) -> str:
+    """Return the GeoTIFF PHOTOMETRIC tag for *n_bands*."""
+    return "rgb" if n_bands in (3, 4) else "minisblack"
+
+
 def _write_tile(
-    data:      np.ndarray,
-    out_path:  Path,
-    profile:   dict,
-    window:    Window,
-    compress:  str,
+    data:         np.ndarray,          # (C, H, W)
+    out_path:     Path,
+    src_profile:  dict,                # dtype, crs, nodata from source
+    tile_window:  Window,              # tile position in source pixel coords
+    src_transform,                     # rasterio.Affine of source dataset
+    compress:     str,
+    global_stats: Optional[List[BandStats]] = None,
 ) -> None:
-    """Write a (C, H, W) array as a GeoTIFF tile."""
+    """Write a (C, H, W) array as a correctly tagged GeoTIFF tile.
 
-    def _block_size(pixels: int, preferred: int = 256) -> int:
-        """Return the largest multiple of 16 that is ≤ min(preferred, pixels).
+    Key design decisions
+    --------------------
+    Profile built from scratch
+        Inheriting the source profile silently propagates PHOTOMETRIC,
+        INTERLEAVE, and block-layout tags that are wrong for small tiles,
+        producing rainbow artefacts and incorrect colour space tags.
 
-        GDAL/GeoTIFF requires block dimensions to be multiples of 16.
-        Edge tiles are narrower than the preferred block size, so we snap
-        down to the nearest valid value (minimum 16).
-        """
-        cap = min(preferred, pixels)
-        snapped = (cap // 16) * 16
-        return max(snapped, 16)
+    PHOTOMETRIC=RGB set explicitly
+        Pansharpened outputs are derived from a single-band PAN profile,
+        which carries PHOTOMETRIC=MINISBLACK.  Without an explicit override
+        GDAL/QGIS renders each band as an independent grey channel.
 
-    tile_profile = profile.copy()
-    tile_profile.update(
-        width    = window.width,
-        height   = window.height,
-        compress = None if compress.lower() == "none" else compress,
-        tiled    = True,
-        blockxsize = _block_size(window.width),
-        blockysize = _block_size(window.height),
-    )
-    # Remove BigTIFF flag for small tiles — avoids unnecessary overhead.
-    tile_profile.pop("BIGTIFF", None)
+    Global STATISTICS tags
+        QGIS and other readers use embedded STATISTICS_MINIMUM/MAXIMUM tags
+        to set the display stretch range.  Per-tile statistics cause each
+        tile to be stretched to its own local contrast range, making adjacent
+        tiles look like they belong to different images.  Global statistics
+        (computed once from a full-scene thumbnail) give every tile the same
+        display mapping as the original full-resolution pansharpened image.
+    """
+    n_bands = data.shape[0]
+    h, w    = data.shape[1], data.shape[2]
+
+    tile_transform = rasterio.windows.transform(tile_window, src_transform)
+
+    tile_profile: dict = {
+        "driver":      "GTiff",
+        "dtype":       src_profile["dtype"],
+        "count":       n_bands,
+        "width":       w,
+        "height":      h,
+        "crs":         src_profile.get("crs"),
+        "transform":   tile_transform,
+        "compress":    None if compress.lower() == "none" else compress,
+        "tiled":       True,
+        "blockxsize":  _block_size(w),
+        "blockysize":  _block_size(h),
+        "interleave":  "band",
+        "photometric": _photometric(n_bands),
+    }
+    if src_profile.get("nodata") is not None:
+        tile_profile["nodata"] = src_profile["nodata"]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(out_path, "w", **tile_profile) as dst:
         dst.write(data)
+
+        # ── Embed global display statistics ───────────────────────────────────
+        # Use pre-computed global stats when available so every tile from the
+        # same source image shares the same QGIS stretch range.
+        # Fall back to per-tile stats only when global stats are not provided.
+        if global_stats is not None:
+            for band_idx, gs in enumerate(global_stats, start=1):
+                dst.update_tags(band_idx,
+                    STATISTICS_MINIMUM = gs.minimum,
+                    STATISTICS_MAXIMUM = gs.maximum,
+                    STATISTICS_MEAN    = gs.mean,
+                    STATISTICS_STDDEV  = gs.stddev,
+                )
+        else:
+            for band_idx in range(n_bands):
+                plane = data[band_idx].astype(np.float64)
+                nodata_val = src_profile.get("nodata")
+                valid = plane[(plane != nodata_val) & np.isfinite(plane)]                         if nodata_val is not None else plane[np.isfinite(plane)]
+                if valid.size:
+                    dst.update_tags(band_idx + 1,
+                        STATISTICS_MINIMUM = float(valid.min()),
+                        STATISTICS_MAXIMUM = float(valid.max()),
+                        STATISTICS_MEAN    = float(valid.mean()),
+                        STATISTICS_STDDEV  = float(valid.std()),
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -396,9 +572,30 @@ def tile_pair(
         with rasterio.open(pair.hr_path) as hr_src, \
              rasterio.open(pair.lr_path) as lr_src:
 
-            hr_profile = hr_src.meta.copy()
-            lr_profile = lr_src.meta.copy()
-            stem       = pair.hr_path.stem
+            # ── Minimal source profiles (dtype, crs, nodata only) ─────────────
+            # Deliberately not copying the full meta/profile so we never
+            # inherit PHOTOMETRIC, INTERLEAVE, or block-layout tags.
+            hr_src_profile = {
+                "dtype":  hr_src.meta["dtype"],
+                "count":  hr_src.meta["count"],
+                "crs":    hr_src.meta.get("crs"),
+                "nodata": hr_src.meta.get("nodata"),
+            }
+            lr_src_profile = {
+                "dtype":  lr_src.meta["dtype"],
+                "count":  lr_src.meta["count"],
+                "crs":    lr_src.meta.get("crs"),
+                "nodata": lr_src.meta.get("nodata"),
+            }
+            hr_transform = hr_src.transform
+            lr_transform = lr_src.transform
+            stem         = pair.hr_path.stem
+
+            # ── Global display statistics (computed once per source image) ─────
+            # These are stamped onto every tile so QGIS uses the same stretch
+            # range for all tiles from the same acquisition.
+            hr_global_stats = _compute_global_stats(hr_src, hr_src_profile.get("nodata"), STATS_MIN_PERCENTILE, STATS_MAX_PERCENTILE)
+            lr_global_stats = _compute_global_stats(lr_src, lr_src_profile.get("nodata"), STATS_MIN_PERCENTILE, STATS_MAX_PERCENTILE)
 
             n_tiles = (
                 math.ceil(hr_src.height / tile_size)
@@ -447,20 +644,16 @@ def tile_pair(
 
                 lr_data = lr_src.read(window=lr_win)
 
-                # Update spatial transform for HR tile.
-                hr_tile_profile = hr_profile.copy()
-                hr_tile_profile["transform"] = rasterio.windows.transform(
-                    hr_win, hr_src.transform
+                _write_tile(
+                    hr_data, hr_out, hr_src_profile,
+                    hr_win, hr_transform, compress,
+                    global_stats=hr_global_stats,
                 )
-
-                # Update spatial transform for LR tile.
-                lr_tile_profile = lr_profile.copy()
-                lr_tile_profile["transform"] = rasterio.windows.transform(
-                    lr_win, lr_src.transform
+                _write_tile(
+                    lr_data, lr_out, lr_src_profile,
+                    lr_win, lr_transform, compress,
+                    global_stats=lr_global_stats,
                 )
-
-                _write_tile(hr_data, hr_out, hr_tile_profile, hr_win, compress)
-                _write_tile(lr_data, lr_out, lr_tile_profile, lr_win, compress)
 
                 stats.tiles_written += 1
 

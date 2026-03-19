@@ -92,7 +92,7 @@ except ImportError:
     sys.exit("ERROR: 'rasterio' is required.  pip install rasterio")
 
 try:
-    from tiling import TileConfig, Tile, crop_tile, iter_tiles, output_window, tile_count
+    from src.preprocessing.tiling import TileConfig, Tile, crop_tile, iter_tiles, output_window, tile_count
 except ImportError:
     sys.exit("ERROR: 'tiling.py' not found.  Place it in the same directory.")
 

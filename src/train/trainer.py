@@ -375,7 +375,7 @@ class Trainer:
 
             elapsed = time.perf_counter() - epoch_start
             log.info(
-                "Epoch [%d/%d]  loss=%.6f  lr=%g  time=%.1fs",
+                "Epoch [%d/%d]  loss=%.3e  lr=%g  time=%.1fs",
                 epoch + 1, total_epochs,
                 train_metrics["loss"], current_lr, elapsed,
             )
@@ -422,7 +422,7 @@ class Trainer:
             )
             self._write_csv_row({
                 "epoch":            epoch + 1,
-                "train_loss":       f"{train_metrics['loss']:.8f}",
+                "train_loss":       f"{train_metrics['loss']:.6e}",
                 "val_psnr_db":      f"{val_psnr:.4f}" if run_val else "",
                 "val_ssim":         f"{val_ssim:.6f}"  if run_val else "",
                 "lr":               f"{current_lr:.2e}",
@@ -482,7 +482,7 @@ class Trainer:
                 avg_loss = total_loss / n_iters
                 lr_now   = self.optimizer.param_groups[0]["lr"]
                 log.debug(
-                    "  [%d/%d | iter %d]  loss=%.6f  lr=%g",
+                    "  [%d/%d | iter %d]  loss=%.3e  lr=%g",
                     epoch + 1, total_epochs, global_iter + 1, avg_loss, lr_now,
                 )
                 if self.writer:
