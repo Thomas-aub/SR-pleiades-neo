@@ -1,6 +1,6 @@
 """
-scripts/training.py — SwinIR Fine-tuning Entry Point
-=====================================================
+scripts/training.py — Swin2-MoSE Fine-tuning Entry Point
+=========================================================
 Assembles all components from ``src/train/``, resolves configuration from
 YAML + optional CLI overrides, then delegates to ``Trainer.fit()``.
 
@@ -26,10 +26,10 @@ Directory layout expected by this script
         configs/swinir_finetune.yaml
         data/processed/train/{HR,LR}/
         data/processed/val/{HR,LR}/
-        pretrained/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth
-        KAIR/                         ← git clone of https://github.com/cszn/KAIR
-        scripts/training.py           ← this file
-        src/train/                    ← library modules
+        pretrained/model-70.pt            ← Swin2-MoSE release checkpoint
+        swin2-mose/                       ← git clone -b official_code
+        scripts/training.py               ← this file
+        src/train/                        ← library modules
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from pathlib import Path
 
 # ── Project root resolution ───────────────────────────────────────────────────
 # Ensures ``src/`` is importable regardless of the working directory.
-_SCRIPT_DIR  = Path(__file__).resolve().parent
+_SCRIPT_DIR   = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -48,10 +48,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 import torch
 from torch.utils.data import DataLoader
 
-from src.train.dataset  import SRTileDataset, worker_init_fn
-from src.train.losses   import build_criterion
-from src.train.trainer  import Trainer
-from src.train.utils    import (
+from src.train.dataset import SRTileDataset, worker_init_fn
+from src.train.losses  import build_criterion
+from src.train.trainer import Trainer
+from src.train.utils   import (
     DotDict,
     build_model,
     build_optimizer,
@@ -72,7 +72,7 @@ from src.train.utils    import (
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog            = "training.py",
-        description     = "Fine-tune SwinIR on a paired HR/LR GeoTIFF dataset.",
+        description     = "Fine-tune Swin2-MoSE on a paired HR/LR GeoTIFF dataset.",
         formatter_class = argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -140,8 +140,7 @@ def _apply_overrides(cfg: DotDict, overrides: list[str]) -> None:
         for k in keys[:-1]:
             if k not in node:
                 node[k] = DotDict()
-            child = node[k]
-            if not isinstance(child, dict):
+            if not isinstance(node[k], dict):
                 node[k] = DotDict()
             node = node[k]
         node[keys[-1]] = value
@@ -209,7 +208,10 @@ def main(argv: list[str] | None = None) -> None:
     # ── Dry-run mode ──────────────────────────────────────────────────────────
     if args.dry_run:
         import json
-        log.info("Resolved configuration:\n%s", json.dumps(dict(cfg), indent=2, default=str))
+        log.info(
+            "Resolved configuration:\n%s",
+            json.dumps(dict(cfg), indent=2, default=str),
+        )
         log.info("Dry-run complete — no files written.")
         return
 
@@ -239,9 +241,6 @@ def main(argv: list[str] | None = None) -> None:
         hr_root          = Path(data_cfg.val_hr),
         lr_root          = Path(data_cfg.val_lr),
         scale            = int(data_cfg.scale),
-        # During validation we use full tiles (no random crop), so set
-        # lr_patch_size to a large value that will never trigger padding.
-        # The actual tile size is what gets read from disk.
         lr_patch_size    = int(data_cfg.lr_patch_size),
         augment          = False,
         dtype_max        = float(data_cfg.dtype_max),
@@ -252,13 +251,14 @@ def main(argv: list[str] | None = None) -> None:
         len(train_dataset), len(val_dataset),
     )
 
+    n_workers = int(data_cfg.num_workers)
     loader_kwargs = dict(
-        num_workers    = int(data_cfg.num_workers),
-        pin_memory     = bool(data_cfg.pin_memory),
-        prefetch_factor= int(getattr(data_cfg, "prefetch_factor", 2))
-                         if int(data_cfg.num_workers) > 0 else None,
-        worker_init_fn = worker_init_fn,
-        persistent_workers = int(data_cfg.num_workers) > 0,
+        num_workers        = n_workers,
+        pin_memory         = bool(data_cfg.pin_memory),
+        prefetch_factor    = int(getattr(data_cfg, "prefetch_factor", 2))
+                             if n_workers > 0 else None,
+        worker_init_fn     = worker_init_fn,
+        persistent_workers = n_workers > 0,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -308,7 +308,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # ── Resume or start fresh ─────────────────────────────────────────────────
-    start_epoch = 0
+    start_epoch     = 0
     resume_path_str = getattr(getattr(cfg, "misc", None), "resume", None)
     if resume_path_str:
         resume_path = Path(resume_path_str)

@@ -1,20 +1,27 @@
 # =============================================================================
-# configs/swinir_finetune.yaml — SwinIR Fine-tuning Configuration
+# configs/swinir_finetune.yaml — Swin2-MoSE Fine-tuning Configuration
 # =============================================================================
 # All paths are resolved relative to the project root (directory that contains
 # configs/, scripts/, and src/) unless absolute.
+#
+# Reference:
+#   Rossi et al. (2024). "Swin2-MoSE: A New Single Image Super-Resolution
+#   Model for Remote Sensing." arXiv:2404.18924.
 # =============================================================================
 
 
 # ── External dependency ───────────────────────────────────────────────────────
-# Absolute or relative path to a local clone of https://github.com/cszn/KAIR
-# The SwinIR model is imported from KAIR/models/network_swinir.py
-kair_root: "KAIR"
+# Absolute or relative path to a local clone of the Swin2-MoSE repository.
+# The model is imported from swin2_mose_model/model.py inside this directory.
+#
+# Clone with:
+#   git clone -b official_code https://github.com/IMPLabUniPr/swin2-mose swin2-mose
+swin2_mose_root: "swin2-mose"
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
-  # Roots for the tiled dataset produced by build_dataset.py
+  # Roots for the tiled dataset produced by build_dataset.py.
   train_hr: "data/processed/train/HR"
   train_lr: "data/processed/train/LR"
   val_hr:   "data/processed/val/HR"
@@ -28,29 +35,28 @@ data:
 
   # LR patch size sampled during training.
   # HR patch = lr_patch_size * scale.
-  # Must be a multiple of model.window_size (default: 8).
-  lr_patch_size: 256
-  # DataLoader settings
-  num_workers: 8
-  pin_memory:  true
+  # Must be a multiple of model.window_size (default 8).
+  lr_patch_size: 192
+
+  # DataLoader settings.
+  num_workers:     12
+  pin_memory:      true
   prefetch_factor: 2
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
-  # Path to a pretrained SwinIR checkpoint (.pth).
-  # Set to null to train from scratch (not recommended — fine-tuning is far
-  # more stable for remote-sensing data).
-  # Download from: https://github.com/JingyunLiang/SwinIR/releases
-  # Recommended: 001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth
-  pretrained_path: "pretrained/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth"
+  # Path to a pretrained Swin2-MoSE checkpoint.
+  # Download from: https://github.com/IMPLabUniPr/swin2-mose/releases
+  # Set to null to train from scratch (not recommended).
+  pretrained_path: "pretrained/model-70.pt"
 
   # Key under which the model weights are stored in the checkpoint dict.
-  # KAIR checkpoints use "params" or "params_ema".  Set to null to load
-  # the checkpoint directly (no nesting).
-  pretrained_key: "params"
+  # Swin2-MoSE release .pt files store the state dict at the top level,
+  # so this should be null.  Set to "params" only for KAIR-style checkpoints.
+  pretrained_key: null
 
-  # ── SwinIR architecture (must match the pretrained checkpoint) ───────────
+  # ── Swin2-MoSE architecture (must match the pretrained checkpoint) ────────
   upscale:          2          # SR scale factor
   in_chans:         3          # Number of input channels (RGB = 3)
   img_size:         64         # Training patch size fed to the transformer
@@ -63,11 +69,21 @@ model:
   upsampler:        "pixelshuffle"   # "pixelshuffle" | "pixelshuffledirect" | ""
   resi_connection:  "1conv"          # "1conv" | "3conv"
 
+  # ── MoE-SM parameters (unique to Swin2-MoSE) ─────────────────────────────
+  # Total number of experts inside each S2ML transformer block.
+  num_experts: 4
+  # Active experts selected per input example via the Top-K gating network.
+  k: 2
+  # Weight for the MoE load-balancing auxiliary loss (Eq. 2, Rossi et al. 2024).
+  # This term encourages uniform expert utilisation and is added to the primary
+  # reconstruction loss during training only.
+  moe_loss_weight: 0.01
+
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  epochs:     200
-  batch_size: 32
+  epochs:     150
+  batch_size: 16
 
   # ── Static freeze (applied for the entire run) ────────────────────────────
   # Ignored when freeze_schedule is defined below.
@@ -81,30 +97,27 @@ training:
   #   frozen_prefixes: parameter name prefixes to freeze.
   #                    null = unfreeze everything.
   #
-  # SwinIR layer names (use as prefixes):
-  #   patch_embed          — initial patch tokenisation
-  #   layers.0 … layers.5  — 6 RSTB transformer stages (pretrained backbone)
-  #   norm                 — final layer normalisation
-  #   conv_after_body      — bridge conv (body → SR head)
-  #   conv_before_upsample — first conv of SR head
-  #   upsample             — pixel-shuffle upsampling block
-  #   conv_last            — final 3-channel output conv
+  # Swin2-MoSE layer names (use as frozen_prefixes):
+  #   patch_embed                — initial patch tokenisation
+  #   layers.0 … layers.5       — 6 S2ML transformer stages (backbone)
+  #   norm                       — final layer normalisation
+  #   conv_after_body            — bridge conv (body → SR head)
+  #   conv_before_upsample       — first conv of SR head
+  #   upsample                   — pixel-shuffle upsampling block
+  #   conv_last                  — final output conv
   #
-  # Recommended two-phase strategy for Pléiades NEO fine-tuning:
+  # Recommended two-phase strategy:
   #
-  #   Phase 1  epochs  0–19  (20 epochs)
-  #     Freeze the entire transformer backbone.  Only the SR head trains
-  #     (~550 K / 11.7 M params).  Loss drops fast.  Head adapts to
-  #     Pléiades radiometry without corrupting pretrained features.
+  #   Phase 1  epochs  0–9  (10 epochs)
+  #     Freeze the entire transformer backbone.  Only the SR head trains.
+  #     Loss drops quickly; the head adapts to satellite radiometry without
+  #     corrupting pretrained MoE-SM features.
   #
-  #   Phase 2  epochs 20–199  (180 epochs)
-  #     Unfreeze everything.  Transformer refines feature extraction for
-  #     satellite textures (vegetation edges, building corners, water)
-  #     that differ from the DF2K natural-photo pretrain set.
-  #
-  # Set to null or [] to disable staged training.
+  #   Phase 2  epochs 10–199  (190 epochs)
+  #     Unfreeze everything.  The transformer backbone and MoE-SM routing
+  #     refine their feature extraction for RS textures.
   freeze_schedule:
-    - until_epoch:      10
+    - until_epoch:      2
       frozen_prefixes:
         - "patch_embed"
         - "layers.0"
@@ -115,15 +128,14 @@ training:
         - "layers.5"
         - "norm"
 
-    - until_epoch:     null   # epoch 20 onwards
+    - until_epoch:     null   # epoch 10 onwards
       frozen_prefixes: null   # unfreeze all
 
   # Gradient clipping: max L2 norm of the gradient vector.
-  # Null to disable.  KAIR uses 0.01 for SwinIR.
+  # Null to disable.
   grad_clip_norm: 0.01
 
-  # Mixed-precision training (torch.cuda.amp).  Speeds up training on Ampere+
-  # GPUs with negligible quality impact.
+  # Mixed-precision training (torch.cuda.amp).
   use_amp: true
 
   # ── Augmentation ─────────────────────────────────────────────────────────
@@ -135,9 +147,8 @@ training:
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
 optimizer:
-  # "adam" | "adamw"
-  type:         "adamw"
-  lr:           1.0e-4
+  type:         "adam"
+  lr:           2.0e-4
   betas:        [0.9, 0.99]
   weight_decay: 0.0
   eps:          1.0e-8
@@ -145,43 +156,44 @@ optimizer:
 
 # ── LR Scheduler ──────────────────────────────────────────────────────────────
 scheduler:
-  # "multistep" → MultiStepLR (KAIR default for SwinIR fine-tuning)
+  # "multistep" → MultiStepLR
   # "cosine"    → CosineAnnealingLR
   # "none"      → constant LR
   type: "multistep"
 
-  # MultiStepLR: epoch indices at which LR is multiplied by gamma.
-  # E.g. with 100 epochs: halve at 40, 60, 80 and 90.
   milestones: [80, 120, 160, 180]
   gamma:      0.5
 
-  # CosineAnnealingLR: minimum LR at the end of the cosine cycle.
-  eta_min:    1.0e-7
+  # CosineAnnealingLR only:
+  eta_min: 1.0e-7
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
 loss:
-  # Primary reconstruction loss.
-  # "charbonnier"  — smooth L1, standard for KAIR SR models
-  # "l1"           — mean absolute error
-  # "mse"          — mean squared error (L2)
-  type:    "charbonnier"
-  eps:     1.0e-6   # Charbonnier smoothing term (ignored for l1/mse)
+  # NCC + SSIM combination loss from Rossi et al. (2024).
+  # Avoids over-smoothing artefacts of MSE / Charbonnier losses, which
+  # suppress high-frequency textures (edges, rooftops, vegetation boundaries)
+  # critical for remote-sensing SR quality.
+  #
+  # Alternatives: "ncc" | "ssim" | "charbonnier" | "l1" | "mse"
+  type:        "ncc_ssim"
+  ncc_weight:  0.5          # Equal weighting as in Rossi et al. 2024
+  ssim_weight: 0.5
+  ncc_eps:     1.0e-8       # Denominator stability for NCCLoss
 
-  # Optional perceptual (VGG) loss.  Requires torchvision.
+  # Optional perceptual (VGG) auxiliary loss.  Requires torchvision.
   perceptual:
     enabled: false
-    weight:  0.1       # Relative weight vs. the primary loss
-    layer:   "relu3_4" # VGG layer used to extract features
+    weight:  0.1
+    layer:   "relu3_4"
 
 
 # ── Logging & checkpointing ───────────────────────────────────────────────────
 logging:
-  # Root directory for all run artefacts (checkpoints, TensorBoard events, …)
-  run_dir: "runs/swinir_finetune_2"
+  run_dir: "runs/swin2mose_finetune"
 
   # Log a training summary every N iterations (not epochs).
-  log_interval_iters: 100
+  log_interval_iters: 10
 
   # Run full validation every N epochs.
   val_interval_epochs: 4
@@ -189,11 +201,10 @@ logging:
   # Save a checkpoint every N epochs.
   save_interval_epochs: 10
 
-  # Keep only the N most recent periodic checkpoints on disk (saves space).
-  # Best-model checkpoint is always kept regardless of this limit.
+  # Keep only the N most recent periodic checkpoints on disk.
+  # The best-model checkpoint is always kept regardless of this limit.
   keep_last_n_checkpoints: 3
 
-  # TensorBoard: set to false to disable.
   tensorboard: true
 
 
@@ -202,7 +213,7 @@ misc:
   seed:   42
   device: "cuda"   # "cuda" | "cpu" | "cuda:1" etc.
 
-  # Path to a checkpoint to resume from.  Overrides pretrained_path for
-  # training-state restoration (optimizer, scheduler, epoch).
-  # Set to null to start a fresh fine-tuning run.
+  # Path to a training checkpoint to resume from.
+  # Overrides pretrained_path for training-state restoration
+  # (optimizer, scheduler, epoch).  Set to null to start fresh.
   resume: null

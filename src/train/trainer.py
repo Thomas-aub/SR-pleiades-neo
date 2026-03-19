@@ -1,6 +1,6 @@
 """
-src/train/trainer.py — SwinIR fine-tuning loop.
-================================================
+src/train/trainer.py — Swin2-MoSE fine-tuning loop.
+=====================================================
 ``Trainer`` encapsulates a single training run: epoch loop, validation,
 checkpoint management, and metric logging.  It is deliberately stateless
 with respect to the filesystem — all I/O paths are derived from the run
@@ -8,16 +8,20 @@ directory injected at construction time.
 
 Design decisions
 ----------------
-* Mixed-precision (AMP) is handled via ``torch.cuda.amp.GradScaler`` and
-  ``torch.autocast``.  The scaler is only activated when ``cfg.training.use_amp``
-  is true *and* the device is CUDA.
+* Mixed-precision (AMP) is handled via ``torch.amp.GradScaler`` and
+  ``torch.autocast``.  The scaler is only activated when
+  ``cfg.training.use_amp`` is true *and* the device is CUDA.
 
-* SwinIR has a window_size constraint: H and W of the input must be divisible
-  by ``window_size``.  ``_pad_to_window`` handles this for validation so
-  full tiles of any size can be evaluated without cropping.
+* Swin2-MoSE forward pass may return a tuple ``(sr, moe_loss)`` where
+  ``moe_loss`` is the MoE load-balancing auxiliary loss (Eq. 2 in Rossi
+  et al. 2024).  ``_train_epoch`` detects both output shapes transparently.
 
-* Best-model tracking compares validation PSNR; the corresponding checkpoint
-  is saved as ``best.pth`` independently of the periodic save cadence.
+* Swin2-MoSE (like SwinIR) requires H and W to be divisible by
+  ``window_size``.  ``_pad_to_window`` handles this for validation so
+  full tiles of arbitrary size can be evaluated without cropping.
+
+* Best-model tracking compares validation PSNR; the corresponding
+  checkpoint is saved as ``best.pth`` independently of the periodic cadence.
 
 * Periodic checkpoint rotation: only the last N checkpoints on disk are kept
   (configurable via ``logging.keep_last_n_checkpoints``).
@@ -30,7 +34,7 @@ import logging
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -44,39 +48,37 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Padding utility
+# Padding utilities
 # ---------------------------------------------------------------------------
 
 def _pad_to_window(
     x:           torch.Tensor,
     window_size: int,
-) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
+) -> Tuple[torch.Tensor, Tuple[int, int, int, int]]:
     """Pad *x* (N, C, H, W) so that H and W are multiples of *window_size*.
 
-    Returns the padded tensor and the (pad_left, pad_right, pad_top, pad_bottom)
+    Returns the padded tensor and the (left, right, top, bottom) padding
     tuple needed to reverse the padding after inference.
     """
     _, _, h, w = x.shape
     pad_h = (window_size - h % window_size) % window_size
     pad_w = (window_size - w % window_size) % window_size
-    # F.pad order: (left, right, top, bottom)
-    padding = (0, pad_w, 0, pad_h)
-    x_padded = torch.nn.functional.pad(x, padding, mode="reflect")
-    return x_padded, (0, pad_w, 0, pad_h)
+    padding = (0, pad_w, 0, pad_h)   # F.pad order: left, right, top, bottom
+    return torch.nn.functional.pad(x, padding, mode="reflect"), padding
 
 
 def _unpad(
     x:       torch.Tensor,
-    padding: tuple[int, int, int, int],
+    padding: Tuple[int, int, int, int],
     scale:   int,
 ) -> torch.Tensor:
-    """Remove the padding added by ``_pad_to_window`` from an SR output.
+    """Remove padding added by ``_pad_to_window`` from an SR output tensor.
 
-    *padding* is the (left, right, top, bottom) tuple returned by
-    ``_pad_to_window`` applied to the LR input; all values are multiplied
-    by *scale* to convert from LR to SR pixel coordinates.
+    *padding* is the (left, right, top, bottom) tuple from ``_pad_to_window``
+    applied to the LR input; values are multiplied by *scale* to convert from
+    LR to SR pixel coordinates.
     """
-    _, _, h, w  = x.shape
+    _, _, h, w              = x.shape
     pad_left, pad_right, pad_top, pad_bottom = padding
     h_end = h - pad_bottom * scale
     w_end = w - pad_right  * scale
@@ -88,17 +90,17 @@ def _unpad(
 # ---------------------------------------------------------------------------
 
 class Trainer:
-    """Manages the full fine-tuning lifecycle for SwinIR.
+    """Manages the full fine-tuning lifecycle for Swin2-MoSE.
 
     Parameters
     ----------
     cfg          : Full DotDict configuration.
-    model        : SwinIR model (already on *device*).
+    model        : Swin2-MoSE model (already on *device*).
     train_loader : DataLoader yielding {"lr", "hr", "name"} dicts.
     val_loader   : DataLoader for validation (batch_size=1 recommended).
     optimizer    : Torch optimizer.
     scheduler    : LR scheduler or None.
-    criterion    : Loss module.
+    criterion    : Loss module — forward(sr, hr) → scalar tensor.
     device       : Compute device.
     run_dir      : Root directory for this run's artefacts.
     writer       : TensorBoard SummaryWriter or None.
@@ -132,7 +134,7 @@ class Trainer:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # results.csv — opened lazily in fit(), flushed after every row.
-        self._csv_path:   Path       = self.run_dir / "results.csv"
+        self._csv_path:   Path         = self.run_dir / "results.csv"
         self._csv_file:   Optional[Any] = None
         self._csv_writer: Optional[Any] = None
 
@@ -141,43 +143,45 @@ class Trainer:
             getattr(cfg.training, "use_amp", False)
             and device.type == "cuda"
         )
-        # torch.amp.GradScaler replaces the deprecated torch.cuda.amp.GradScaler.
-        # We keep a CPU-safe fallback: GradScaler is a no-op when enabled=False,
-        # but it still requires a valid device string when constructed with the
-        # new API (PyTorch ≥ 2.3).
         _scaler_device = device.type if device.type == "cuda" else "cpu"
         self._scaler = torch.amp.GradScaler(_scaler_device, enabled=self._use_amp)
 
+        # MoE auxiliary loss weight (Eq. 2, Rossi et al. 2024).
+        # Applied only when the model returns (sr, moe_loss).
+        self._moe_loss_weight = float(getattr(cfg.model, "moe_loss_weight", 1e-2))
+
         # Hyperparameters from config.
-        self._window_size      = int(cfg.model.window_size)
-        self._scale            = int(cfg.model.upscale)
-        self._grad_clip        = getattr(cfg.training, "grad_clip_norm", None)
-        self._log_interval     = int(getattr(cfg.logging, "log_interval_iters",  100))
-        self._val_interval     = int(getattr(cfg.logging, "val_interval_epochs",   5))
-        self._save_interval    = int(getattr(cfg.logging, "save_interval_epochs", 10))
-        self._keep_n           = int(getattr(cfg.logging, "keep_last_n_checkpoints", 3))
+        self._window_size   = int(cfg.model.window_size)
+        self._scale         = int(cfg.model.upscale)
+        self._grad_clip     = getattr(cfg.training, "grad_clip_norm", None)
+        self._log_interval  = int(getattr(cfg.logging, "log_interval_iters",    100))
+        self._val_interval  = int(getattr(cfg.logging, "val_interval_epochs",     5))
+        self._save_interval = int(getattr(cfg.logging, "save_interval_epochs",   10))
+        self._keep_n        = int(getattr(cfg.logging, "keep_last_n_checkpoints", 3))
 
         # State maintained across epochs.
-        self.start_epoch: int   = 0
-        self.best_psnr:   float = 0.0
-        self._periodic_ckpts: Deque[Path] = deque()
+        self.start_epoch:      int         = 0
+        self.best_psnr:        float       = 0.0
+        self._periodic_ckpts: Deque[Path]  = deque()
 
-        # ── Freeze schedule ───────────────────────────────────────────────────
-        # Parsed once from cfg.training.freeze_schedule (list of phase dicts).
-        # Applied at the start of each epoch via _apply_freeze_schedule().
-        self._freeze_schedule: List[Dict] = self._parse_freeze_schedule()
+        # Freeze schedule — parsed once, applied at the start of each epoch.
+        self._freeze_schedule: List[Dict]          = self._parse_freeze_schedule()
         self._current_frozen_prefixes: Optional[List[str]] = None  # sentinel
 
         log.info(
             "Trainer ready — AMP=%s  window_size=%d  scale=%d  "
-            "val_every=%d  save_every=%d epochs",
+            "moe_loss_weight=%g  val_every=%d  save_every=%d epochs",
             self._use_amp, self._window_size, self._scale,
-            self._val_interval, self._save_interval,
+            self._moe_loss_weight, self._val_interval, self._save_interval,
         )
         if self._freeze_schedule:
             log.info("Freeze schedule: %d phase(s) defined.", len(self._freeze_schedule))
             for phase in self._freeze_schedule:
-                label = f"epochs 0–{phase['until_epoch'] - 1}" if phase["until_epoch"] is not None else "remaining epochs"
+                label    = (
+                    f"epochs 0–{phase['until_epoch'] - 1}"
+                    if phase["until_epoch"] is not None
+                    else "remaining epochs"
+                )
                 prefixes = phase["frozen_prefixes"] or "none (all layers trainable)"
                 log.info("  %-30s  frozen: %s", label, prefixes)
 
@@ -189,16 +193,12 @@ class Trainer:
         """Parse and validate training.freeze_schedule from config.
 
         Each entry in the YAML list must have:
-            until_epoch    : int | null — this phase applies for epochs < until_epoch.
+            until_epoch    : int | null — active while epoch < until_epoch.
                              null means "for all remaining epochs".
-            frozen_prefixes: list[str] | null — parameter name prefixes to freeze.
+            frozen_prefixes: list[str] | null — prefixes to freeze.
                              null means "unfreeze everything".
 
-        Phases are sorted by until_epoch (null = infinity) so they are applied
-        in the correct order regardless of YAML ordering.
-
-        Returns an empty list when no schedule is configured, in which case the
-        static frozen_prefixes from build_model() is used for the whole run.
+        Phases are sorted by until_epoch (null = infinity).
         """
         raw = getattr(getattr(self.cfg, "training", {}), "freeze_schedule", None)
         if not raw:
@@ -206,7 +206,7 @@ class Trainer:
 
         parsed = []
         for i, entry in enumerate(raw):
-            until = entry.get("until_epoch", None)
+            until    = entry.get("until_epoch", None)
             prefixes = entry.get("frozen_prefixes", None)
             if until is not None:
                 until = int(until)
@@ -216,50 +216,50 @@ class Trainer:
                     )
             parsed.append({"until_epoch": until, "frozen_prefixes": prefixes})
 
-        # Sort: phases with a finite until_epoch come first (ascending),
-        # the catch-all null phase (if any) comes last.
-        parsed.sort(key=lambda p: p["until_epoch"] if p["until_epoch"] is not None else float("inf"))
+        parsed.sort(
+            key=lambda p: p["until_epoch"]
+            if p["until_epoch"] is not None
+            else float("inf")
+        )
         return parsed
 
     def _apply_freeze_schedule(self, epoch: int) -> None:
         """Freeze / unfreeze model parameters according to the schedule.
 
-        Finds the first phase whose until_epoch > epoch (i.e. the phase that
-        is currently active) and applies its frozen_prefixes.  If the active
-        set of prefixes has not changed since last epoch, this is a no-op so
-        there is no overhead in the common case.
+        Finds the first phase whose until_epoch > epoch (i.e. the currently
+        active phase) and applies its frozen_prefixes.  No-op when the active
+        set of prefixes has not changed since last epoch.
 
         Called at the *start* of each epoch before _train_epoch() so the
         optimizer only sees trainable parameters for that epoch.
 
         Note: the optimizer was built with all parameters; we set
-        requires_grad=False rather than rebuilding the optimizer, which means
-        the optimizer state for frozen parameters persists in memory but is not
-        updated.  This is intentional — it allows seamless unfreezing later.
+        requires_grad=False rather than rebuilding the optimizer so that
+        optimizer state for frozen parameters persists and seamless unfreezing
+        is possible later.
         """
         if not self._freeze_schedule:
             return
 
-        # Find the active phase for this epoch.
-        active_prefixes = None  # default: unfreeze all
+        active_prefixes: Optional[List[str]] = None
         for phase in self._freeze_schedule:
             if phase["until_epoch"] is None or epoch < phase["until_epoch"]:
                 active_prefixes = phase["frozen_prefixes"]
                 break
 
-        # Normalise to a frozenset for O(1) change detection.
         active_set = frozenset(active_prefixes) if active_prefixes else frozenset()
-        prev_set   = frozenset(self._current_frozen_prefixes) if self._current_frozen_prefixes else frozenset()
-
+        prev_set   = (
+            frozenset(self._current_frozen_prefixes)
+            if self._current_frozen_prefixes
+            else frozenset()
+        )
         if active_set == prev_set:
-            return  # No change — skip the parameter scan.
+            return
 
         self._current_frozen_prefixes = list(active_prefixes) if active_prefixes else []
 
-        frozen_count   = 0
-        trainable_count = 0
-        frozen_params  = 0
-        trainable_params = 0
+        frozen_count = trainable_count = 0
+        frozen_params = trainable_params = 0
 
         for name, param in self.model.named_parameters():
             should_freeze = bool(active_prefixes) and any(
@@ -300,6 +300,7 @@ class Trainer:
     _CSV_COLUMNS = [
         "epoch",
         "train_loss",
+        "train_moe_loss",
         "val_psnr_db",
         "val_ssim",
         "lr",
@@ -313,7 +314,7 @@ class Trainer:
         """Open (or append to) results.csv.
 
         On a fresh run the header is written first.  When resuming, rows
-        are appended so the file contains the full history of all runs.
+        are appended so the file contains the full training history.
         """
         mode = "a" if (resume and self._csv_path.exists()) else "w"
         self._csv_file   = open(self._csv_path, mode, newline="", encoding="utf-8")
@@ -348,8 +349,8 @@ class Trainer:
 
     def fit(self, start_epoch: int = 0) -> None:
         """Run training from *start_epoch* to cfg.training.epochs."""
-        self.start_epoch    = start_epoch
-        total_epochs = int(self.cfg.training.epochs)
+        self.start_epoch = start_epoch
+        total_epochs     = int(self.cfg.training.epochs)
 
         log.info(
             "Starting fine-tuning: epoch %d → %d  (%d epoch(s) remaining)",
@@ -366,7 +367,6 @@ class Trainer:
 
             train_metrics = self._train_epoch(epoch, total_epochs)
 
-            # LR scheduler step (MultiStep / Cosine).
             if self.scheduler is not None:
                 self.scheduler.step()
                 current_lr = self.scheduler.get_last_lr()[0]
@@ -375,20 +375,25 @@ class Trainer:
 
             elapsed = time.perf_counter() - epoch_start
             log.info(
-                "Epoch [%d/%d]  loss=%.3e  lr=%g  time=%.1fs",
+                "Epoch [%d/%d]  loss=%.3e  moe_loss=%.3e  lr=%g  time=%.1fs",
                 epoch + 1, total_epochs,
-                train_metrics["loss"], current_lr, elapsed,
+                train_metrics["loss"], train_metrics["moe_loss"],
+                current_lr, elapsed,
             )
 
             if self.writer:
-                self.writer.add_scalar("train/loss", train_metrics["loss"], epoch)
-                self.writer.add_scalar("train/lr",   current_lr,            epoch)
+                self.writer.add_scalar("train/loss",     train_metrics["loss"],     epoch)
+                self.writer.add_scalar("train/moe_loss", train_metrics["moe_loss"], epoch)
+                self.writer.add_scalar("train/lr",       current_lr,                epoch)
 
             # ── Validation ────────────────────────────────────────────────────
-            is_best    = False
-            val_psnr   = float("nan")
-            val_ssim   = float("nan")
-            run_val    = (epoch + 1) % self._val_interval == 0 or epoch == total_epochs - 1
+            is_best  = False
+            val_psnr = float("nan")
+            val_ssim = float("nan")
+            run_val  = (
+                (epoch + 1) % self._val_interval == 0
+                or epoch == total_epochs - 1
+            )
 
             if run_val:
                 val_metrics = self._validate(epoch, total_epochs)
@@ -423,6 +428,7 @@ class Trainer:
             self._write_csv_row({
                 "epoch":            epoch + 1,
                 "train_loss":       f"{train_metrics['loss']:.6e}",
+                "train_moe_loss":   f"{train_metrics['moe_loss']:.6e}",
                 "val_psnr_db":      f"{val_psnr:.4f}" if run_val else "",
                 "val_ssim":         f"{val_ssim:.6f}"  if run_val else "",
                 "lr":               f"{current_lr:.2e}",
@@ -447,10 +453,17 @@ class Trainer:
         epoch:        int,
         total_epochs: int,
     ) -> Dict[str, float]:
-        """Run one full training epoch and return aggregated metrics."""
+        """Run one full training epoch and return aggregated metrics.
+
+        Returns
+        -------
+        dict with keys "loss" (combined) and "moe_loss" (auxiliary, 0.0 when
+        the model does not return an auxiliary loss term).
+        """
         self.model.train()
-        total_loss      = 0.0
-        n_iters         = 0
+        total_loss     = 0.0
+        total_moe_loss = 0.0
+        n_iters        = 0
 
         for i, batch in enumerate(self.train_loader):
             lr = batch["lr"].to(self.device, non_blocking=True)
@@ -459,8 +472,31 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=self.device.type, enabled=self._use_amp):
-                sr   = self.model(lr)
+                output = self.model(lr)
+
+                # Swin2-MoSE returns (sr, moe_loss) to enforce expert balance
+                # (Eq. 2 in Rossi et al. 2024).  The auxiliary term may be a
+                # Tensor or a plain Python int(0) when no balancing loss is
+                # active — only add it to the backward graph when it is a real
+                # Tensor with grad_fn, so we guard with isinstance rather than
+                # `is not None`.
+                if isinstance(output, tuple):
+                    sr, moe_loss = output
+                else:
+                    sr, moe_loss = output, None
+
+                # Scalar int/float 0 from the model is treated as inactive.
+                _moe_is_tensor = isinstance(moe_loss, torch.Tensor)
+
+                # SR output must be in [0, 1] before the loss is computed —
+                # matching the clamp applied during validation.  Without this,
+                # early-training fp16 activations can produce values far outside
+                # [0, 1] that overflow float32 inside SSIM / NCC after casting.
+                sr = sr.float().clamp(0.0, 1.0)
+
                 loss = self.criterion(sr, hr)
+                if _moe_is_tensor:
+                    loss = loss + self._moe_loss_weight * moe_loss
 
             self._scaler.scale(loss).backward()
 
@@ -473,22 +509,34 @@ class Trainer:
             self._scaler.step(self.optimizer)
             self._scaler.update()
 
-            total_loss += loss.item()
-            n_iters    += 1
+            loss_val = loss.item()
+            if not torch.isfinite(loss).item():
+                log.warning(
+                    "Non-finite loss at epoch %d iter %d (%.3e) — skipping accumulation.",
+                    epoch + 1, i + 1, loss_val,
+                )
+            else:
+                total_loss     += loss_val
+                total_moe_loss += moe_loss.item() if _moe_is_tensor else 0.0
+                n_iters        += 1
 
-            # ── Iteration-level logging ───────────────────────────────────────
             global_iter = epoch * len(self.train_loader) + i
             if (i + 1) % self._log_interval == 0:
                 avg_loss = total_loss / n_iters
                 lr_now   = self.optimizer.param_groups[0]["lr"]
-                log.debug(
-                    "  [%d/%d | iter %d]  loss=%.3e  lr=%g",
-                    epoch + 1, total_epochs, global_iter + 1, avg_loss, lr_now,
+                log.info(
+                    "  [%d/%d | iter %d/%d]  loss=%.3e  lr=%g",
+                    epoch + 1, total_epochs, i + 1, len(self.train_loader),
+                    avg_loss, lr_now,
                 )
                 if self.writer:
                     self.writer.add_scalar("train/iter_loss", avg_loss, global_iter)
 
-        return {"loss": total_loss / max(n_iters, 1)}
+        denom = max(n_iters, 1)
+        return {
+            "loss":     total_loss     / denom,
+            "moe_loss": total_moe_loss / denom,
+        }
 
     # ------------------------------------------------------------------
     # Validation epoch
@@ -507,14 +555,14 @@ class Trainer:
 
         Why AMP is disabled here
         ------------------------
-        During training, patches are 64×64.  During validation, full tiles
-        are used (e.g. 512×512 LR → 1024×1024 SR).  SwinIR's shifted-window
-        attention computes large intermediate activation tensors; with fp16
-        these overflow to Inf/NaN for inputs larger than ~128 px.  We always
-        run validation in float32 regardless of ``use_amp``.
+        During training, patches are typically 64 × 64.  During validation,
+        full tiles are used (e.g. 512 × 512 LR → 1024 × 1024 SR).  The
+        Swin-family shifted-window attention computes large intermediate
+        activation tensors; with fp16 these overflow to Inf / NaN for inputs
+        larger than ~128 px.  We always run validation in float32.
         """
         self.model.eval()
-        tracker = MetricTracker()
+        tracker     = MetricTracker()
         nan_skipped = 0
 
         for batch in self.val_loader:
@@ -522,19 +570,18 @@ class Trainer:
             hr = batch["hr"].to(self.device, non_blocking=True)
             n  = lr.shape[0]
 
-            # Pad LR to satisfy window_size constraint.
             lr_padded, padding = _pad_to_window(lr, self._window_size)
 
-            # Always use float32 for validation — see docstring.
             with torch.autocast(device_type=self.device.type, enabled=False):
-                sr_padded = self.model(lr_padded.float())
+                raw = self.model(lr_padded.float())
+                # Discard the MoE auxiliary loss during validation — it is only
+                # used for load balancing during training.
+                sr_padded = raw[0] if isinstance(raw, tuple) else raw
 
             sr = _unpad(sr_padded, padding, self._scale)
             sr = sr.float().clamp(0.0, 1.0)
             hr = hr.float()
 
-            # Guard: skip any batch where the model still produced NaN
-            # (e.g. corrupt tile on disk).
             if not torch.isfinite(sr).all():
                 nan_skipped += n
                 log.warning(
@@ -567,13 +614,12 @@ class Trainer:
 
     def _checkpoint_state(self, epoch: int, best_psnr: float) -> dict:
         """Build the serialisable checkpoint dict."""
-        sch_state = self.scheduler.state_dict() if self.scheduler else None
         return {
             "epoch":     epoch,
             "best_psnr": best_psnr,
             "model":     self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-            "scheduler": sch_state,
+            "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "scaler":    self._scaler.state_dict(),
         }
 

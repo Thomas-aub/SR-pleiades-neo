@@ -17,7 +17,7 @@ Public API
   save_checkpoint(state, path)
   load_checkpoint(path, model, optimizer, scheduler, device)  → start_epoch
   get_logger(name, log_dir)            → logging.Logger
-  get_writer(cfg)                      → SummaryWriter | None
+  get_writer(cfg, log_dir)             → SummaryWriter | None
 """
 
 from __future__ import annotations
@@ -46,7 +46,8 @@ class DotDict(dict):
     """dict subclass that supports recursive attribute-style access.
 
     Nested dicts are automatically promoted to DotDict on access so that
-    ``cfg.training.batch_size`` works identically to ``cfg["training"]["batch_size"]``.
+    ``cfg.training.batch_size`` works identically to
+    ``cfg["training"]["batch_size"]``.
     """
 
     def __getattr__(self, key: str) -> Any:
@@ -95,11 +96,10 @@ def set_seed(seed: int) -> None:
     """Set Python, NumPy, and PyTorch seeds for reproducibility.
 
     Note: full determinism on GPU also requires setting
-    ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` before launching the process, and
-    calling ``torch.use_deterministic_algorithms(True)``.  We do not
-    force deterministic algorithms here because some cuDNN kernels used by
-    SwinIR (e.g. adaptive average pooling) do not have deterministic
-    implementations on all GPU generations.
+    ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` and calling
+    ``torch.use_deterministic_algorithms(True)``.  We do not force
+    deterministic algorithms here because some cuDNN kernels used by
+    Swin-family models do not have deterministic implementations on all GPUs.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -130,159 +130,69 @@ def resolve_device(cfg: DotDict) -> torch.device:
 # Model
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Pretrained weight download
-# ---------------------------------------------------------------------------
-
-# Official SwinIR release artefacts hosted on GitHub Releases.
-# Key: (upscale, in_chans) — values that identify the standard checkpoints.
-_SWINIR_URLS: dict = {
-    (2, 3): "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/"
-             "001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth",
-    (3, 3): "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/"
-             "001_classicalSR_DF2K_s64w8_SwinIR-M_x3.pth",
-    (4, 3): "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/"
-             "001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth",
-}
-
-
-def _download_pretrained(dest: Path, upscale: int = 2, in_chans: int = 3) -> Optional[Path]:
-    """Download a SwinIR pretrained checkpoint from GitHub Releases.
-
-    Parameters
-    ----------
-    dest     : Destination file path (directory is created automatically).
-    upscale  : SR scale factor — used to select the correct release asset.
-    in_chans : Number of input channels (default 3 = RGB).
-
-    Returns
-    -------
-    Path to the downloaded file, or None if download failed.
-    """
-    import urllib.request
-    import urllib.error
-
-    _log = logging.getLogger(__name__)
-    url = _SWINIR_URLS.get((upscale, in_chans))
-
-    if url is None:
-        _log.error(
-            "No known pretrained checkpoint for upscale=%d in_chans=%d.\n"
-            "Please set model.pretrained_path to a local .pth file.",
-            upscale, in_chans,
-        )
-        return None
-
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    _log.info(
-        "Pretrained checkpoint not found at '%s'.\n"
-        "  Downloading from: %s",
-        dest, url,
-    )
-
-    tmp = dest.with_suffix(".tmp")
-    _CHUNK  = 1 << 20   # 1 MiB read chunks
-    _TIMEOUT = 60        # seconds — connect + read timeout per chunk
-
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "SwinIR-finetune/1.0"})
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            total_mb = total / (1 << 20) if total else 0
-
-            print(
-                f"  Downloading {dest.name}"
-                + (f" ({total_mb:.1f} MB)" if total_mb else ""),
-                flush=True,
-            )
-
-            downloaded = 0
-            with open(tmp, "wb") as fh:
-                while True:
-                    chunk = resp.read(_CHUNK)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        pct = downloaded / total * 100
-                        bar = "#" * int(pct / 2)
-                        print(f"\r  [{bar:<50}] {pct:5.1f}%", end="", flush=True)
-            print()  # newline after progress bar
-
-        tmp.replace(dest)
-        _log.info("Pretrained checkpoint saved to: %s", dest)
-        return dest
-
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        _log.error(
-            "Download failed: %s\n"
-            "  Please download manually from:\n"
-            "  https://github.com/JingyunLiang/SwinIR/releases\n"
-            "  and save it to: %s",
-            exc, dest,
-        )
-        if tmp.exists():
-            tmp.unlink()
-        return None
-
-
 def build_model(cfg: DotDict, device: torch.device) -> nn.Module:
-    """Instantiate SwinIR from KAIR and optionally load pretrained weights.
+    """Instantiate Swin2-MoSE and optionally load pretrained weights.
 
-    KAIR integration
-    ----------------
-    The function inserts ``cfg.kair_root`` at the front of ``sys.path`` so
-    that ``from models.network_swinir import SwinIR`` resolves to the KAIR
-    checkout.  The path is removed after import to avoid polluting sys.path.
+    Swin2-MoSE integration
+    -----------------------
+    ``cfg.swin2_mose_root`` is temporarily prepended to ``sys.path`` so that
+    ``from swin2_mose_model.model import Swin2MoSE`` resolves to the local
+    repo checkout.  The path is removed after import to avoid polluting
+    ``sys.path`` for the rest of the process.
+
+    Clone and set up the repo::
+
+        git clone -b official_code \\
+            https://github.com/IMPLabUniPr/swin2-mose swin2-mose
 
     Pretrained weights
     ------------------
-    If ``cfg.model.pretrained_path`` is set and the file exists, weights are
-    loaded with ``strict=True``.  KAIR checkpoints wrap state dicts under a
-    ``params`` (or ``params_ema``) key; ``cfg.model.pretrained_key``
-    controls which key to look for.
+    If ``cfg.model.pretrained_path`` points to an existing file, weights are
+    loaded with ``strict=False`` (MoE-specific buffers absent from older
+    checkpoints are silently skipped).
+
+    The optional ``cfg.model.pretrained_key`` extracts a nested state dict
+    from the checkpoint dict.  Set it to ``null`` for Swin2-MoSE ``.pt``
+    release assets, which store the state dict at the top level.
+
+    MoE-SM architecture parameters
+    --------------------------------
+    Swin2-MoSE accepts two extra constructor arguments vs. Swin2SR:
+
+    * ``num_experts``  — Total MoE-SM experts per transformer block.
+    * ``k``            — Active experts per input example (Top-K gate).
+
+    Both are read from ``cfg.model`` and default to 4 and 2 respectively,
+    matching the configuration reported in the paper.
 
     Frozen layers
     -------------
-    Parameters whose names start with any prefix in
-    ``cfg.training.frozen_prefixes`` are frozen (``requires_grad = False``).
+    Parameters whose names start with any prefix listed in
+    ``cfg.training.frozen_prefixes`` have ``requires_grad`` set to False.
+    Swin2-MoSE shares the same top-level layer names as Swin2SR / SwinIR:
+    ``patch_embed``, ``layers.0`` … ``layers.5``, ``norm``,
+    ``conv_after_body``, ``conv_before_upsample``, ``upsample``,
+    ``conv_last``.
     """
-    log = logging.getLogger(__name__)
-    kair_root = Path(cfg.kair_root).resolve()
-    if not kair_root.exists():
+    _log = logging.getLogger(__name__)
+
+    swin2_mose_root = Path(cfg.swin2_mose_root).resolve()
+    if not swin2_mose_root.exists():
         raise FileNotFoundError(
-            f"KAIR root not found: {kair_root}\n"
-            "Clone it with:  git clone https://github.com/cszn/KAIR"
+            f"Swin2-MoSE root not found: {swin2_mose_root}\n"
+            "Clone the repo with:\n"
+            "  git clone -b official_code "
+            "https://github.com/IMPLabUniPr/swin2-mose swin2-mose"
         )
 
-    # Temporarily expose KAIR modules.
-    # We suppress two warnings that originate inside KAIR / timm and are
-    # not actionable from our side:
-    #   • torch.meshgrid indexing FutureWarning  (KAIR uses the old positional API)
-    #   • timm.models.layers import DeprecationWarning  (timm internal rename)
-    import warnings
-    sys.path.insert(0, str(kair_root))
+    sys.path.insert(0, str(swin2_mose_root))
     try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="torch.meshgrid.*indexing",
-                category=UserWarning,
-            )
-            warnings.filterwarnings(
-                "ignore",
-                message="Importing from timm.models.layers",
-                category=FutureWarning,
-            )
-            from models.network_swinir import SwinIR  # noqa: PLC0415
+        from swin2_mose_model.model import Swin2MoSE  # noqa: PLC0415
     finally:
-        sys.path.remove(str(kair_root))
+        sys.path.remove(str(swin2_mose_root))
 
     m = cfg.model
-    model = SwinIR(
+    model = Swin2MoSE(
         upscale         = int(m.upscale),
         in_chans        = int(m.in_chans),
         img_size        = int(m.img_size),
@@ -294,28 +204,61 @@ def build_model(cfg: DotDict, device: torch.device) -> nn.Module:
         mlp_ratio       = float(m.mlp_ratio),
         upsampler       = str(m.upsampler),
         resi_connection = str(m.resi_connection),
+        # MoE-SM parameters — unique to Swin2-MoSE.
+        num_experts     = int(getattr(m, "num_experts", 4)),
+        k               = int(getattr(m, "k",           2)),
     )
 
-    # ── Load pretrained weights (auto-download if missing) ───────────────────
+    # ── Pretrained weights ────────────────────────────────────────────────────
     pretrained_path = getattr(m, "pretrained_path", None)
     if pretrained_path:
         ckpt_path = Path(pretrained_path)
         if not ckpt_path.exists():
-            ckpt_path = _download_pretrained(ckpt_path, upscale=int(m.upscale))
+            _log.warning(
+                "Pretrained checkpoint not found: %s\n"
+                "  Download from the Swin2-MoSE releases page:\n"
+                "  https://github.com/IMPLabUniPr/swin2-mose/releases",
+                ckpt_path,
+            )
+        else:
+            _log.info("Loading pretrained weights from: %s", ckpt_path)
+            raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-        if ckpt_path is not None and ckpt_path.exists():
-            log.info("Loading pretrained weights from: %s", ckpt_path)
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            key  = getattr(m, "pretrained_key", "params") or "params"
-            state_dict = ckpt.get(key, ckpt) if isinstance(ckpt, dict) else ckpt
+            # Resolve the state dict from the (possibly nested) checkpoint.
+            # Priority: explicit pretrained_key → "model" key → flat dict.
+            key = getattr(m, "pretrained_key", None)
+            if key and isinstance(raw, dict) and key in raw:
+                state_dict = raw[key]
+            elif isinstance(raw, dict) and "model" in raw:
+                state_dict = raw["model"]
+            elif isinstance(raw, dict) and not any(
+                k in raw for k in ("model", "params", "params_ema")
+            ):
+                # Top-level flat state dict (Swin2-MoSE .pt release format).
+                state_dict = raw
+            else:
+                state_dict = raw.get(key, raw) if isinstance(raw, dict) else raw
+
+            # Strip DataParallel prefix if present.
+            if any(k.startswith("module.") for k in state_dict):
+                state_dict = {
+                    k.removeprefix("module."): v for k, v in state_dict.items()
+                }
+
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if missing:
-                log.warning("Missing keys in checkpoint (%d): %s …", len(missing), missing[:3])
+                _log.warning(
+                    "Pretrained checkpoint — missing keys (%d): %s …",
+                    len(missing), missing[:3],
+                )
             if unexpected:
-                log.warning("Unexpected keys in checkpoint (%d): %s …", len(unexpected), unexpected[:3])
-            log.info("Pretrained weights loaded (key='%s').", key)
+                _log.warning(
+                    "Pretrained checkpoint — unexpected keys (%d): %s …",
+                    len(unexpected), unexpected[:3],
+                )
+            _log.info("Pretrained weights loaded.")
 
-    # ── Freeze requested layers ───────────────────────────────────────────────
+    # ── Static layer freeze ───────────────────────────────────────────────────
     frozen_prefixes = getattr(getattr(cfg, "training", DotDict()), "frozen_prefixes", None)
     if frozen_prefixes:
         frozen_count = 0
@@ -323,15 +266,15 @@ def build_model(cfg: DotDict, device: torch.device) -> nn.Module:
             if any(name.startswith(p) for p in frozen_prefixes):
                 param.requires_grad = False
                 frozen_count += 1
-        log.info(
+        _log.info(
             "Froze %d parameter tensor(s) matching prefixes: %s",
             frozen_count, frozen_prefixes,
         )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
-    log.info(
-        "Model: SwinIR — trainable params %s / total %s (%.1f%%)",
+    _log.info(
+        "Model: Swin2-MoSE — trainable %s / total %s params (%.1f%%)",
         f"{trainable:,}", f"{total:,}", 100.0 * trainable / max(total, 1),
     )
 
@@ -348,13 +291,13 @@ def build_optimizer(cfg: DotDict, model: nn.Module) -> torch.optim.Optimizer:
     Only parameters with ``requires_grad=True`` are passed to the optimizer
     so frozen layers are not tracked and do not consume gradient memory.
     """
-    log = logging.getLogger(__name__)
-    opt_cfg = cfg.optimizer
+    _log     = logging.getLogger(__name__)
+    opt_cfg  = cfg.optimizer
     opt_type = str(opt_cfg.type).lower()
 
     params = [p for p in model.parameters() if p.requires_grad]
 
-    kwargs = dict(
+    kwargs: Dict[str, Any] = dict(
         lr           = float(opt_cfg.lr),
         betas        = tuple(float(b) for b in opt_cfg.betas),
         weight_decay = float(getattr(opt_cfg, "weight_decay", 0.0)),
@@ -366,9 +309,11 @@ def build_optimizer(cfg: DotDict, model: nn.Module) -> torch.optim.Optimizer:
     elif opt_type == "adamw":
         optimizer = torch.optim.AdamW(params, **kwargs)
     else:
-        raise ValueError(f"Unknown optimizer type '{opt_type}'.  Choose: adam, adamw.")
+        raise ValueError(
+            f"Unknown optimizer type '{opt_type}'.  Choose from: adam, adamw."
+        )
 
-    log.info(
+    _log.info(
         "Optimizer: %s  lr=%g  betas=%s  wd=%g",
         opt_type, kwargs["lr"], kwargs["betas"], kwargs["weight_decay"],
     )
@@ -387,12 +332,12 @@ def build_scheduler(
 
     Returns None if ``scheduler.type`` is "none".
     """
-    log = logging.getLogger(__name__)
+    _log     = logging.getLogger(__name__)
     sch_cfg  = cfg.scheduler
     sch_type = str(getattr(sch_cfg, "type", "none")).lower()
 
     if sch_type == "none":
-        log.info("Scheduler : none (constant LR)")
+        _log.info("Scheduler: none (constant LR)")
         return None
 
     if sch_type == "multistep":
@@ -401,7 +346,9 @@ def build_scheduler(
         scheduler  = torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=milestones, gamma=gamma
         )
-        log.info("Scheduler : MultiStepLR  milestones=%s  γ=%g", milestones, gamma)
+        _log.info(
+            "Scheduler: MultiStepLR  milestones=%s  γ=%g", milestones, gamma
+        )
         return scheduler
 
     if sch_type == "cosine":
@@ -410,11 +357,14 @@ def build_scheduler(
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=t_max, eta_min=eta_min
         )
-        log.info("Scheduler : CosineAnnealingLR  T_max=%d  η_min=%g", t_max, eta_min)
+        _log.info(
+            "Scheduler: CosineAnnealingLR  T_max=%d  η_min=%g", t_max, eta_min
+        )
         return scheduler
 
     raise ValueError(
-        f"Unknown scheduler type '{sch_type}'.  Choose from: none, multistep, cosine."
+        f"Unknown scheduler type '{sch_type}'.  "
+        f"Choose from: none, multistep, cosine."
     )
 
 
@@ -424,8 +374,8 @@ def build_scheduler(
 
 def save_checkpoint(state: dict, path: Path) -> None:
     """Atomically save *state* to *path* using a temp file + rename."""
-    path    = Path(path)
-    tmp     = path.with_suffix(".tmp")
+    path = Path(path)
+    tmp  = path.with_suffix(".tmp")
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, tmp)
     tmp.replace(path)
@@ -448,26 +398,28 @@ def load_checkpoint(
     -------
     start_epoch : int — next epoch index (checkpoint_epoch + 1).
     """
-    log = logging.getLogger(__name__)
+    _log = logging.getLogger(__name__)
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    log.info("Resuming from checkpoint: %s", path)
+    _log.info("Resuming from checkpoint: %s", path)
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
-    # Strip DataParallel prefix if present.
     state_dict = ckpt["model"]
     if any(k.startswith("module.") for k in state_dict):
         state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
 
     model.load_state_dict(state_dict, strict=True)
     optimizer.load_state_dict(ckpt["optimizer"])
-    if scheduler is not None and "scheduler" in ckpt and ckpt["scheduler"] is not None:
+    if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
 
     start_epoch = int(ckpt.get("epoch", 0)) + 1
-    log.info("Resumed at epoch %d  (best PSNR: %.2f dB)", start_epoch - 1, ckpt.get("best_psnr", 0.0))
+    _log.info(
+        "Resumed at epoch %d  (best PSNR: %.2f dB)",
+        start_epoch - 1, ckpt.get("best_psnr", 0.0),
+    )
     return start_epoch
 
 
@@ -482,13 +434,12 @@ def get_logger(name: str, log_dir: Optional[Path] = None) -> logging.Logger:
 
     1. Root-logger level
        By default the root logger sits at WARNING.  Any helper module that
-       calls ``logging.getLogger(__name__)`` (e.g. ``src.train.utils``) will
-       have its INFO messages silently dropped, even if a handler exists on
-       the named "training" logger, because propagation stops at the first
-       ancestor whose level filters out the message.  We set the root level
-       to DEBUG and attach a single console handler to the root so that every
-       module in the project can emit INFO+ messages without needing its own
-       handler registration.
+       calls ``logging.getLogger(__name__)`` will have its INFO messages
+       silently dropped, even if a handler exists on the named "training"
+       logger, because propagation stops at the first ancestor whose level
+       filters out the message.  We set the root level to DEBUG and attach a
+       single console handler so that every module in the project can emit
+       INFO+ messages without needing its own handler.
 
     2. Duplicate handlers on re-call
        The root handler is only added once (guard on root.handlers), and the
@@ -499,7 +450,6 @@ def get_logger(name: str, log_dir: Optional[Path] = None) -> logging.Logger:
         datefmt="%H:%M:%S",
     )
 
-    # ── Root logger: single console handler, INFO level ───────────────────────
     root = logging.getLogger()
     if not root.handlers:
         root.setLevel(logging.DEBUG)
@@ -508,25 +458,24 @@ def get_logger(name: str, log_dir: Optional[Path] = None) -> logging.Logger:
         console.setFormatter(formatter)
         root.addHandler(console)
     else:
-        root.setLevel(logging.DEBUG)  # ensure level is not WARNING
+        root.setLevel(logging.DEBUG)
 
-    # ── Named logger: optional file handler ───────────────────────────────────
     logger = logging.getLogger(name)
-    # Check if a FileHandler is already present to avoid duplicates on re-call.
+    # Guard against duplicate FileHandlers when get_logger is called twice.
     if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
         return logger
 
     if log_dir is not None:
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
+
         fh = logging.FileHandler(log_dir / "training.log", encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(formatter)
         logger.addHandler(fh)
-        # Prevent the named logger from also printing to the root console handler
-        # (which would double-print every message).
+
+        # propagate=False avoids double-printing via the root console handler.
         logger.propagate = False
-        # The named logger needs its own console handler since propagate=False.
         console_named = logging.StreamHandler(sys.stdout)
         console_named.setLevel(logging.INFO)
         console_named.setFormatter(formatter)
@@ -541,6 +490,7 @@ def get_writer(cfg: DotDict, log_dir: Path) -> Optional[Any]:
         return None
     try:
         from torch.utils.tensorboard import SummaryWriter  # noqa: PLC0415
+
         writer = SummaryWriter(log_dir=str(log_dir / "tensorboard"))
         logging.getLogger(__name__).info(
             "TensorBoard logs → %s", log_dir / "tensorboard"
