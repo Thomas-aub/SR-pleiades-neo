@@ -24,42 +24,6 @@ Raw PAN + MS  →  Pansharpening  →  HR GeoTIFF
 
 ---
 
-## Table of Contents
-
-- [SR-Pléiades NEO — Satellite Super-Resolution Pipeline](#sr-pléiades-neo--satellite-super-resolution-pipeline)
-  - [Table of Contents](#table-of-contents)
-  - [Project structure](#project-structure)
-  - [Requirements](#requirements)
-  - [Installation](#installation)
-  - [Data layout](#data-layout)
-  - [Stage 1 — Preprocessing](#stage-1--preprocessing)
-    - [Pansharpening](#pansharpening)
-    - [Sensor degradation](#sensor-degradation)
-    - [Dataset tiling](#dataset-tiling)
-    - [Running the full pipeline](#running-the-full-pipeline)
-  - [Stage 2 — Training](#stage-2--training)
-    - [Training configuration](#training-configuration)
-    - [Running training](#running-training)
-    - [Resuming a run](#resuming-a-run)
-    - [Monitoring](#monitoring)
-  - [Stage 3 — Inference](#stage-3--inference)
-    - [Inference configuration](#inference-configuration)
-    - [Running inference](#running-inference)
-  - [Configuration reference](#configuration-reference)
-    - [`configs/swinir_finetune.yaml`](#configsswinir_finetuneyaml)
-    - [`configs/inference.yaml`](#configsinferenceyaml)
-  - [Troubleshooting](#troubleshooting)
-    - [`loss=nan` during training](#lossnan-during-training)
-    - [`PSNR=nan` during validation](#psnrnan-during-validation)
-    - [Black SR output image](#black-sr-output-image)
-    - [GPU out-of-memory during training](#gpu-out-of-memory-during-training)
-    - [GPU out-of-memory during inference](#gpu-out-of-memory-during-inference)
-    - [KAIR import warning: `torch.meshgrid`](#kair-import-warning-torchmeshgrid)
-    - [`rasterio.errors.RasterBlockError: BLOCKXSIZE must be a multiple of 16`](#rasterioerrorsrasterblockerror-blockxsize-must-be-a-multiple-of-16)
-  - [Acknowledgements](#acknowledgements)
-
----
-
 ## Project structure
 
 ```
@@ -112,47 +76,11 @@ SR-pleiades-neo/
 
 ## Requirements
 
-| Dependency | Version tested | Notes |
-|---|---|---|
-| Python | ≥ 3.12 | |
-| PyTorch | ≥ 2.3 | CUDA 12.x recommended |
-| rasterio | ≥ 1.3 | Requires GDAL |
-| numpy | ≥ 1.26 | |
-| tqdm | any | |
-| pyyaml | any | |
-| timm | any | Pulled in by KAIR |
-| tensorboard | any | Optional — for training curves |
-| torchvision | any | Optional — for perceptual loss |
-| cupy-cuda12x | any | Optional — GPU acceleration for preprocessing |
 
 ---
 
 ## Installation
 
-```bash
-# 1. Clone this repository
-git clone https://github.com/your-org/SR-pleiades-neo.git
-cd SR-pleiades-neo
-
-# 2. Clone KAIR (SwinIR model definition)
-git clone https://github.com/cszn/KAIR
-
-# 3. Create and activate a conda environment
-conda create -n sr_env python=3.12
-conda activate sr_env
-
-# 4. Install PyTorch (adjust cuda version to match your driver)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-
-# 5. Install remaining dependencies
-pip install rasterio numpy tqdm pyyaml timm tensorboard
-
-# 6. (Optional) GPU-accelerated preprocessing
-pip install cupy-cuda12x
-```
-
-> **Pretrained weights** are downloaded automatically on the first training run.  
-> They are saved to `pretrained/001_classicalSR_DF2K_s64w8_SwinIR-M_x2.pth`.
 
 ---
 
@@ -465,49 +393,7 @@ Output files are written to the configured `output_dir` with `_SR.TIF` appended 
 
 > **Note on `misc.use_fp16`:** SwinIR's shifted-window attention overflows fp16 for inputs larger than ~128 px, producing NaN → black output. Inference always runs in float32 regardless of this setting. The flag is kept for future use.
 
----
 
-## Troubleshooting
-
-### `loss=nan` during training
-
-The Charbonnier loss correctly masks nodata pixels (NaN after normalisation). If loss is still NaN:
-- Check `data.dtype_max`: must be `65535` for uint16 tiles, `255` for uint8.
-- Verify tiles are not entirely nodata — check `min_valid_fraction` in `build_dataset.py`.
-- Lower `optimizer.lr` (try `5e-5`).
-
-### `PSNR=nan` during validation
-
-AMP (fp16) is automatically disabled during validation. If PSNR is still NaN:
-- The model may not have learned yet (normal in the first 1–2 epochs with low LR).
-- Check that `data.dtype_max` matches the bit depth of your tiles.
-
-### Black SR output image
-
-- Confirm `model.checkpoint_key: "model"` in `inference.yaml` for fine-tuned checkpoints.
-- Confirm `io.dtype_max` matches the value used during training.
-- Run `gdalinfo output/IMG_..._SR.TIF` and check that min/max statistics are non-zero.
-
-### GPU out-of-memory during training
-
-- Reduce `training.batch_size` (e.g. `8`).
-- Reduce `data.lr_patch_size` (e.g. `48`, must remain a multiple of `model.window_size=8`).
-
-### GPU out-of-memory during inference
-
-- Reduce `tiling.tile_size` in `inference.yaml` (e.g. `128`).
-
-### KAIR import warning: `torch.meshgrid`
-
-This warning originates inside KAIR and is suppressed automatically. It does not affect correctness.
-
-### `rasterio.errors.RasterBlockError: BLOCKXSIZE must be a multiple of 16`
-
-This is handled automatically in `build_dataset.py`. If it appears in another context, ensure block sizes are rounded down to the nearest multiple of 16 with a minimum of 16.
-
----
-
-## Acknowledgements
 
 - **SwinIR** — [Liang et al., 2021](https://arxiv.org/abs/2108.10257)  
   Model definition from [KAIR](https://github.com/cszn/KAIR) by Kai Zhang et al.
