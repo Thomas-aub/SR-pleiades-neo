@@ -1,4 +1,4 @@
-# SR-Pléiades NEO — Satellite Super-Resolution Pipeline
+# SR-Pléiades NEO - Satellite Super-Resolution Pipeline
 
 End-to-end pipeline for training and running a **SwinIR super-resolution model** on **Pléiades NEO** satellite imagery. Raw PAN + multispectral acquisitions are pansharpened, degraded to synthetic LR pairs, tiled into a dataset, and used to fine-tune a pretrained SwinIR-M ×2 model.
 
